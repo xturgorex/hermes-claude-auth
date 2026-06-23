@@ -113,6 +113,31 @@ def _patch_error_classifier(_module):
     anthropic_billing_bypass._install_thinking_replay_classifier_patch()
 
 
+def _patch_run_agent(module):
+    """Install subscription rate-limit auto-wait on AIAgent.
+
+    Triggered when run_agent is first imported (the gateway startup sequence
+    imports it before the first API call).  Patches the two interruptible
+    API-call methods so a Claude Pro/Max 5-hour-window 429 sleeps until the
+    window resets and retries transparently, instead of letting Hermes core's
+    120s-backoff-capped loop give up and surface "rate-limiting requests"
+    to Telegram.
+    """
+    anthropic_billing_bypass = _load_billing_bypass()
+    if anthropic_billing_bypass is None:
+        return
+
+    try:
+        ok = anthropic_billing_bypass.install_rate_limit_autowait(module)
+        if ok:
+            sys.stderr.write("[hermes-claude-auth] rate-limit auto-wait installed\n")
+    except Exception as exc:
+        sys.stderr.write(
+            f"[hermes-claude-auth] rate-limit auto-wait install failed: "
+            f"{type(exc).__name__}: {exc}\n"
+        )
+
+
 def _install_hook() -> None:
     """Back-compatible helper: install only the historical adapter hook."""
     _make_import_hook(_TARGET_MODULE, _patch_anthropic_adapter, "hermes-claude-auth")
@@ -123,6 +148,11 @@ def _install_all_hooks() -> None:
         "agent.error_classifier",
         _patch_error_classifier,
         "hermes-claude-auth-errors",
+    )
+    _make_import_hook(
+        "run_agent",
+        _patch_run_agent,
+        "hermes-claude-auth-rl-autowait",
     )
     _install_hook()
 

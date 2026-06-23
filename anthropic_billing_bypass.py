@@ -85,7 +85,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.7"
+__version__ = "1.5.8"
 
 import hashlib
 import inspect
@@ -94,6 +94,7 @@ import logging
 import os
 import platform
 import sys
+import time
 import traceback
 from typing import Any, Dict, List, Set
 
@@ -1136,6 +1137,363 @@ def _install_response_pascalcase_unhook(
             any_installed = True
 
     return any_installed
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Subscription rate-limit auto-wait (Claude Pro/Max 5-hour window)
+# =========================================================================
+# When a long agent run exhausts the Claude Pro/Max usage window mid-flight,
+# api.anthropic.com returns HTTP 429 (rate_limit_error) with a reset time in
+# the ``retry-after`` and/or ``anthropic-ratelimit-unified-reset`` headers.
+# Hermes core's retry loop caps backoff at 120s and gives up after
+# ``_api_max_retries``, surfacing "rate-limiting requests" on Telegram and
+# abandoning the run.
+#
+# This patch wraps the two API-call entry points on ``run_agent.AIAgent``
+# (``_interruptible_api_call`` and ``_interruptible_streaming_api_call``) so a
+# genuine subscription-window 429 instead SLEEPS until the window resets
+# (interruptibly, in short chunks) and then retries the same call
+# transparently — the give-up logic never runs.  Per-minute throttles (short
+# resets) are slept through too.  Behaviour is tunable via env vars:
+#
+#   HERMES_RL_AUTOWAIT          "1"/"0"  enable/disable     (default 1)
+#   HERMES_RL_AUTOWAIT_MAX_S    int      safety cap seconds (default 21600 = 6h)
+#   HERMES_RL_AUTOWAIT_BUFFER_S int      pad after reset    (default 5)
+#   HERMES_RL_AUTOWAIT_DEFAULT_S int     wait when no reset (default 300)
+#
+# The wait loop also calls ``agent._touch_activity(...)`` every ~25s so the
+# gateway's inactivity watchdog (default 1800s = 30 min) doesn't kill the
+# agent mid-wait.  Without this tick the auto-wait would always lose to the
+# watchdog at ~30 min, defeating the whole feature.
+#
+# Idempotent.  Never breaks the call path: if anything goes wrong parsing or
+# patching, the original method/exception behaviour is preserved.
+
+_RL_AUTOWAIT_PATCHED_FLAG = "_CLAUDE_CODE_RL_AUTOWAIT_PATCHED"
+
+
+def _rl_env_int(name: str, default: int) -> int:
+    try:
+        v = int(str(os.environ.get(name, "")).strip())
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _rl_autowait_enabled() -> bool:
+    return str(os.environ.get("HERMES_RL_AUTOWAIT", "1")).strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _rl_is_rate_limit_error(exc: Exception) -> bool:
+    """True only for a real HTTP 429 from the provider."""
+    if exc is None:
+        return False
+    if type(exc).__name__ == "RateLimitError":
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    return status == 429
+
+
+def _rl_parse_headers(exc: Exception) -> Dict[str, str]:
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return {}
+    try:
+        return {str(k).lower(): str(v) for k, v in dict(headers).items()}
+    except Exception:
+        try:
+            return {str(k).lower(): str(headers[k]) for k in headers}  # type: ignore[index]
+        except Exception:
+            return {}
+
+
+def _rl_seconds_until_reset(exc: Exception) -> "float | None":
+    """Seconds to wait, parsed from the 429's reset headers.
+
+    Order of preference:
+      1. ``retry-after``                       (RFC 7231: delta-seconds or HTTP-date)
+      2. ``anthropic-ratelimit-unified-reset`` (epoch seconds or RFC 3339)
+      3. ``anthropic-ratelimit-*-reset``       (epoch seconds or RFC 3339)
+    Returns None if no parseable reset is present.
+    """
+    import calendar
+    import datetime as _dt
+    import email.utils as _eut
+
+    headers = _rl_parse_headers(exc)
+    if not headers:
+        return None
+    now = time.time()
+
+    def _from_timestamp_or_rfc3339(raw: str) -> "float | None":
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        # epoch seconds (Anthropic unified-reset is usually a Unix timestamp)
+        try:
+            ts = float(raw)
+            # If it looks like an absolute epoch (in the future), use delta;
+            # if it's a small number, treat as a relative duration.
+            if ts > 1_000_000_000:  # ~2001+, clearly absolute epoch seconds
+                return max(0.0, ts - now)
+            return max(0.0, ts)
+        except ValueError:
+            pass
+        # RFC 3339 / ISO 8601
+        try:
+            iso = raw.replace("Z", "+00:00")
+            dt = _dt.datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return max(0.0, dt.timestamp() - now)
+        except Exception:
+            return None
+
+    # 1. retry-after
+    ra = headers.get("retry-after")
+    if ra:
+        ra = ra.strip()
+        try:
+            return max(0.0, float(ra))  # delta-seconds
+        except ValueError:
+            try:  # HTTP-date
+                parsed = _eut.parsedate_to_datetime(ra)
+                if parsed is not None:
+                    return max(0.0, parsed.timestamp() - now)
+            except Exception:
+                pass
+
+    # 2 + 3. anthropic-ratelimit-*-reset (unified first, then any other)
+    unified = headers.get("anthropic-ratelimit-unified-reset")
+    if unified:
+        secs = _from_timestamp_or_rfc3339(unified)
+        if secs is not None:
+            return secs
+    candidates = [
+        v for k, v in headers.items()
+        if k.startswith("anthropic-ratelimit-") and k.endswith("-reset")
+    ]
+    best = None
+    for raw in candidates:
+        secs = _from_timestamp_or_rfc3339(raw)
+        if secs is not None:
+            best = secs if best is None else max(best, secs)
+    return best
+
+
+def _rl_fmt_eta(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{m}m {sec}s" if sec else f"{m}m"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def _rl_local_clock(seconds_from_now: float) -> str:
+    try:
+        t = time.localtime(time.time() + max(0.0, seconds_from_now))
+        return time.strftime("%H:%M", t)
+    except Exception:
+        return "?"
+
+
+def _rl_emit(agent: Any, message: str) -> None:
+    """Best-effort user-facing status — reaches Telegram via status_callback."""
+    try:
+        emit = getattr(agent, "_emit_status", None)
+        if callable(emit):
+            emit(message)
+            return
+    except Exception:
+        pass
+    try:
+        logger.warning("[rl-autowait] %s", message)
+    except Exception:
+        pass
+
+
+def _rl_touch(agent: Any, desc: str) -> None:
+    """Bump the agent's liveness signal so the gateway inactivity timer
+    doesn't kill us mid-wait.
+
+    The gateway polls ``get_activity_summary()["seconds_since_activity"]``
+    every few seconds and aborts the run when it exceeds
+    ``agent.gateway_timeout`` (default 1800s = 30 min).  Without a tick here,
+    a long rate-limit wait (up to ``HERMES_RL_AUTOWAIT_MAX_S`` = 6h) silently
+    trips the timeout while we're just sleeping.  Calling the agent's own
+    ``_touch_activity`` resets ``seconds_since_activity`` to ~0; it never
+    raises, and is a no-op when the agent predates this method.
+    """
+    try:
+        touch = getattr(agent, "_touch_activity", None)
+        if callable(touch):
+            touch(desc)
+    except Exception:
+        # Liveness tick must never break the wait.
+        logger.debug("[rl-autowait] touch_activity failed", exc_info=True)
+
+
+def _rl_interrupted(agent: Any) -> bool:
+    """True if the user asked to stop — so we abort the wait promptly."""
+    if getattr(agent, "_interrupt_requested", False):
+        return True
+    try:
+        from tools.interrupt import is_interrupted as _is_int  # type: ignore
+        tid = getattr(agent, "_execution_thread_id", None)
+        return bool(_is_int(tid)) if tid is not None else bool(_is_int())
+    except Exception:
+        return False
+
+
+def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
+    """Sleep until the rate-limit window resets.  Returns True if we waited
+    (caller should retry), False if we should re-raise (cap hit / interrupted /
+    unparseable with auto-wait disabled)."""
+    max_wait = _rl_env_int("HERMES_RL_AUTOWAIT_MAX_S", 21600)      # 6h safety cap
+    buffer_s = _rl_env_int("HERMES_RL_AUTOWAIT_BUFFER_S", 5)
+    default_s = _rl_env_int("HERMES_RL_AUTOWAIT_DEFAULT_S", 300)
+
+    reset = _rl_seconds_until_reset(exc)
+    if reset is None:
+        # No parseable reset header.  Use a conservative default so we still
+        # recover from subscription-window 429s that omit the header.
+        reset = float(default_s)
+        had_header = False
+    else:
+        had_header = True
+    wait_s = min(reset + buffer_s, float(max_wait))
+
+    if wait_s <= 0:
+        return True  # already reset — retry immediately
+
+    if reset + buffer_s > max_wait:
+        _rl_emit(
+            agent,
+            f"⏱️ Лимит Claude исчерпан, но сброс через "
+            f"{_rl_fmt_eta(reset)} — это больше safety-cap "
+            f"({_rl_fmt_eta(max_wait)}). Останавливаюсь.",
+        )
+        return False
+
+    eta = _rl_fmt_eta(wait_s)
+    clock = _rl_local_clock(wait_s)
+    src = "" if had_header else " (оценка)"
+    _rl_emit(
+        agent,
+        f"⏸ Лимит Claude исчерпан. Жду сброса окна ≈{eta}{src} "
+        f"(продолжу примерно в {clock}). Засыпаю…",
+    )
+
+    # Touch activity once before sleeping so the gateway sees the wait
+    # as legitimate activity rather than a hung API call.  Then refresh
+    # the liveness signal every ~25s inside the chunk loop — well under
+    # the default gateway_timeout (1800s) and gateway_timeout_warning
+    # (900s), so neither the warning nor the kill fires.
+    _rl_touch(agent, f"auto-waiting for Claude rate-limit reset (≈{eta})")
+    last_touch = time.monotonic()
+    _TOUCH_INTERVAL_S = 25.0
+
+    deadline = time.time() + wait_s
+    # Sleep in short chunks so a user interrupt (or /stop) breaks out quickly.
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        if _rl_interrupted(agent):
+            _rl_emit(agent, "⏹ Прерывание во время ожидания лимита — останавливаюсь.")
+            return False
+        time.sleep(min(5.0, remaining))
+        # Refresh liveness periodically.  Cheap and best-effort.
+        if time.monotonic() - last_touch >= _TOUCH_INTERVAL_S:
+            last_touch = time.monotonic()
+            remaining_str = _rl_fmt_eta(max(0.0, deadline - time.time()))
+            _rl_touch(
+                agent,
+                f"auto-waiting for Claude rate-limit reset (≈{remaining_str} left)",
+            )
+
+    _rl_emit(agent, "▶ Лимит сброшен — продолжаю выполнение.")
+    return True
+
+
+def _rl_wrap_call(original_method):
+    """Wrap an AIAgent API-call method with subscription rate-limit auto-wait."""
+
+    def wrapper(self, *args: Any, **kwargs: Any):
+        if not _rl_autowait_enabled():
+            return original_method(self, *args, **kwargs)
+        attempt = 0
+        while True:
+            try:
+                return original_method(self, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it's a 429 we handle
+                if not _rl_is_rate_limit_error(exc):
+                    raise
+                attempt += 1
+                # Decide whether to wait-and-retry or give up (re-raise so
+                # Hermes core's normal handling/give-up path takes over).
+                try:
+                    should_retry = _rl_sleep_until_reset(self, exc, attempt)
+                except Exception:
+                    logger.debug("[rl-autowait] sleep handler error", exc_info=True)
+                    should_retry = False
+                if not should_retry:
+                    raise
+                # loop and retry the identical call
+
+    wrapper.__name__ = getattr(original_method, "__name__", "interruptible_api_call")
+    wrapper.__qualname__ = getattr(original_method, "__qualname__", wrapper.__name__)
+    wrapper.__doc__ = getattr(original_method, "__doc__", None)
+    wrapper.__wrapped__ = original_method  # type: ignore[attr-defined]
+    return wrapper
+
+
+def install_rate_limit_autowait(run_agent_module: Any = None) -> bool:
+    """Patch ``run_agent.AIAgent`` so subscription-window 429s wait-and-resume.
+
+    Idempotent.  Returns True if installed (or already installed), False if the
+    target class/methods are missing (API drift) — in which case the original
+    behaviour is untouched.
+    """
+    ram = run_agent_module
+    if ram is None:
+        try:
+            import run_agent as ram  # type: ignore[no-redef]
+        except Exception as exc:
+            logger.debug("[rl-autowait] cannot import run_agent: %s", exc)
+            return False
+
+    agent_cls = getattr(ram, "AIAgent", None)
+    if agent_cls is None:
+        logger.debug("[rl-autowait] run_agent.AIAgent missing; skipping")
+        return False
+    if getattr(agent_cls, _RL_AUTOWAIT_PATCHED_FLAG, False):
+        return True
+
+    patched_any = False
+    for name in ("_interruptible_api_call", "_interruptible_streaming_api_call"):
+        original = getattr(agent_cls, name, None)
+        if not callable(original):
+            continue
+        setattr(agent_cls, name, _rl_wrap_call(original))
+        patched_any = True
+        logger.info("[rl-autowait] wrapped AIAgent.%s", name)
+
+    if not patched_any:
+        return False
+    setattr(agent_cls, _RL_AUTOWAIT_PATCHED_FLAG, True)
+    logger.debug("[rl-autowait] subscription rate-limit auto-wait installed")
+    return True
 
 
 def apply_patches(anthropic_adapter_module: Any = None) -> bool:
