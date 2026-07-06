@@ -85,6 +85,7 @@ results.
 7. **Haiku effort stripping**: `effort` parameter is removed for haiku models that reject it with HTTP 400 (upstream PR #126)
 8. **Temperature fix**: Strips non-default `temperature` on Opus 4.6 adaptive thinking, which otherwise rejects with HTTP 400
 9. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
+10. **Window-aware rate-limit auto-wait** (v1.5.9+): when Anthropic returns HTTP 429 mid-agent, reads the `anthropic-ratelimit-unified-{5h,1d,7d}-status` / `-reset` headers to identify which subscription window tripped, picks the **longest** waiting window (sleeping through a 7d reset also clears 5h), and applies a **per-window** safety cap (`HERMES_RL_AUTOWAIT_MAX_5H_S`=6h, `_1D_S`=26h, `_7D_S`=7.5d). The legacy 6h cap is kept as the fallback when no window-specific status is present. Per-window caps can be tuned via env vars.
 
 Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interpreter startup with no source modifications.
 
@@ -262,6 +263,28 @@ import hooks** (2 Claude + 9 Antigravity). Two cautions:
 
 - **HTTP 400: "Third-party apps now draw from your extra usage, not your plan limits"**: Anthropic's server-side validation has classified your requests as third-party and routed them to pay-per-token credits instead of your Max/Pro plan. Make sure you're on the latest version of this patch (it tracks the upstream [opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth) fingerprint changes). Reinstall with `./install.sh` and restart `hermes-gateway`. If the error persists after update, the bypass is currently broken upstream too — track [issue #6](https://github.com/kristianvast/hermes-claude-auth/issues/6) for status.
 - **HTTP 400 persists after update**: The billing salt or signature format may have been rotated by Anthropic again. Check for newer commits to this repo.
+
+### Rate-limit / 429 behaviour
+
+- **Auto-wait won't kick in / 429 reaches the user immediately**: the patch
+  is disabled. Re-enable with `HERMES_RL_AUTOWAIT=1` (the default). It
+  requires the `sitecustomize.py` hook to be installed (run `./install.sh`
+  and check with `./install.sh --check`).
+- **Auto-wait bails with "this is bigger than safety-cap" on a weekly limit**:
+  you're on an older build (< v1.5.9). v1.5.9 added window-aware
+  detection — it now reads `anthropic-ratelimit-unified-7d-status` /
+  `-reset` and waits up to `HERMES_RL_AUTOWAIT_MAX_7D_S` (default 7.5d).
+  Upgrade: `cd ~/hermes-claude-auth && git pull && ./install.sh`.
+- **Want a shorter / longer wait for a specific window**: tune the
+  per-window cap via env vars (values in seconds, units in
+  `~/.hermes/.env` or your systemd unit):
+  - `HERMES_RL_AUTOWAIT_MAX_5H_S` (default `21600` = 6h)
+  - `HERMES_RL_AUTOWAIT_MAX_1D_S` (default `93600` = 26h)
+  - `HERMES_RL_AUTOWAIT_MAX_7D_S` (default `648000` = 7.5d)
+  - `HERMES_RL_AUTOWAIT_MAX_S` — fallback when the 429 has no
+    window-specific status header (default `21600` = 6h).
+  Setting any of the `MAX_*_S` vars to a value `<= 0` falls back to the
+  default; to *disable* auto-wait entirely, use `HERMES_RL_AUTOWAIT=0`.
 
 ## Credits
 - [griffinmartin/opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth), the original TypeScript implementation for opencode (MIT)

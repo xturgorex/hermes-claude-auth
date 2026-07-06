@@ -85,7 +85,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.8"
+__version__ = "1.5.9"
 
 import hashlib
 import inspect
@@ -1140,11 +1140,11 @@ def _install_response_pascalcase_unhook(
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Subscription rate-limit auto-wait (Claude Pro/Max 5-hour window)
+# Subscription rate-limit auto-wait (Claude Pro/Max windows: 5h, 1d, 7d)
 # =========================================================================
-# When a long agent run exhausts the Claude Pro/Max usage window mid-flight,
+# When a long agent run exhausts a Claude Pro/Max usage window mid-flight,
 # api.anthropic.com returns HTTP 429 (rate_limit_error) with a reset time in
-# the ``retry-after`` and/or ``anthropic-ratelimit-unified-reset`` headers.
+# the ``retry-after`` and/or ``anthropic-ratelimit-unified-*-reset`` headers.
 # Hermes core's retry loop caps backoff at 120s and gives up after
 # ``_api_max_retries``, surfacing "rate-limiting requests" on Telegram and
 # abandoning the run.
@@ -1154,12 +1154,24 @@ def _install_response_pascalcase_unhook(
 # genuine subscription-window 429 instead SLEEPS until the window resets
 # (interruptibly, in short chunks) and then retries the same call
 # transparently — the give-up logic never runs.  Per-minute throttles (short
-# resets) are slept through too.  Behaviour is tunable via env vars:
+# resets) are slept through too.
 #
-#   HERMES_RL_AUTOWAIT          "1"/"0"  enable/disable     (default 1)
-#   HERMES_RL_AUTOWAIT_MAX_S    int      safety cap seconds (default 21600 = 6h)
-#   HERMES_RL_AUTOWAIT_BUFFER_S int      pad after reset    (default 5)
-#   HERMES_RL_AUTOWAIT_DEFAULT_S int     wait when no reset (default 300)
+# As of v1.5.9 the auto-wait is **window-aware**: Anthropic now reports which
+# subscription window tripped via the unified
+# ``anthropic-ratelimit-unified-{5h,1d,7d}-status`` / ``-reset`` headers.
+# We pick the **longest** waiting window (e.g. a 7d hit also covers the 5h
+# window, so a single sleep clears both) and apply a **per-window** safety
+# cap — the legacy 6h cap is no longer the bottleneck when the weekly
+# window trips.  Behaviour is tunable via env vars:
+#
+#   HERMES_RL_AUTOWAIT               "1"/"0"  enable/disable           (default 1)
+#   HERMES_RL_AUTOWAIT_MAX_S         int      fallback cap seconds     (default 21600 = 6h)
+#                                                (used when no window could be detected)
+#   HERMES_RL_AUTOWAIT_MAX_5H_S      int      5h-window safety cap     (default 21600 = 6h)
+#   HERMES_RL_AUTOWAIT_MAX_1D_S      int      1d-window safety cap     (default 93600 = 26h)
+#   HERMES_RL_AUTOWAIT_MAX_7D_S      int      7d-window safety cap     (default 648000 = 7.5d)
+#   HERMES_RL_AUTOWAIT_BUFFER_S      int      pad after reset          (default 5)
+#   HERMES_RL_AUTOWAIT_DEFAULT_S     int      wait when no reset found (default 300)
 #
 # The wait loop also calls ``agent._touch_activity(...)`` every ~25s so the
 # gateway's inactivity watchdog (default 1800s = 30 min) doesn't kill the
@@ -1213,78 +1225,156 @@ def _rl_parse_headers(exc: Exception) -> Dict[str, str]:
             return {}
 
 
-def _rl_seconds_until_reset(exc: Exception) -> "float | None":
-    """Seconds to wait, parsed from the 429's reset headers.
+# Anthropic rate-limit windows we recognise.  The numeric suffix (``5h``,
+# ``1d``, ``7d``) matches the suffix Anthropic uses in the
+# ``anthropic-ratelimit-unified-*-status`` / ``-reset`` / ``-utilization``
+# headers.  ``5h`` is the Pro/Max subscription window; ``7d`` is the weekly
+# cap; ``1d`` appears on some enterprise tiers.
+_RL_KNOWN_WINDOWS: tuple = ("7d", "1d", "5h")
 
-    Order of preference:
-      1. ``retry-after``                       (RFC 7231: delta-seconds or HTTP-date)
-      2. ``anthropic-ratelimit-unified-reset`` (epoch seconds or RFC 3339)
-      3. ``anthropic-ratelimit-*-reset``       (epoch seconds or RFC 3339)
-    Returns None if no parseable reset is present.
+
+def _rl_parse_timestamp(raw: str, now: float) -> "float | None":
+    """Parse a ``anthropic-ratelimit-*-reset`` value into seconds-until-reset.
+
+    Accepts:
+      * absolute epoch seconds (Anthropic's typical form),
+      * a small relative duration in seconds,
+      * RFC 3339 / ISO 8601 timestamps.
+
+    Returns ``None`` if the value can't be parsed.  ``now`` is the reference
+    time in ``time.time()`` seconds — passed in so all callers in a single
+    429-handling path agree on "now" (avoids drift across separate calls).
     """
-    import calendar
     import datetime as _dt
+    import email.utils as _eut
+
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    # epoch seconds (Anthropic unified-reset is usually a Unix timestamp)
+    try:
+        ts = float(raw)
+        # If it looks like an absolute epoch (in the future), use delta;
+        # if it's a small number, treat as a relative duration.
+        if ts > 1_000_000_000:  # ~2001+, clearly absolute epoch seconds
+            return max(0.0, ts - now)
+        return max(0.0, ts)
+    except ValueError:
+        pass
+    # RFC 3339 / ISO 8601
+    try:
+        iso = raw.replace("Z", "+00:00")
+        dt = _dt.datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return max(0.0, dt.timestamp() - now)
+    except Exception:
+        return None
+    # retry-after / HTTP-date as a last resort
+    try:
+        parsed = _eut.parsedate_to_datetime(raw)
+        if parsed is not None:
+            return max(0.0, parsed.timestamp() - now)
+    except Exception:
+        return None
+    return None
+
+
+def _rl_status_for(window: str) -> str:
+    return f"anthropic-ratelimit-unified-{window}-status"
+
+
+def _rl_reset_for(window: str) -> str:
+    return f"anthropic-ratelimit-unified-{window}-reset"
+
+
+def _rl_detect_throttled_window(headers: Dict[str, str], now: float) -> "tuple":
+    """Identify the throttled subscription window and its reset delta.
+
+    Returns ``(window_name, seconds_until_reset)`` where either field may be
+    ``None``.  When several windows are throttled at once (e.g. 5h and 7d
+    both at the cap on a heavy Pro run), we pick the **longest** wait so a
+    single sleep clears everything — waiting through a 7d reset also clears
+    the 5h window.
+    """
+    if not headers:
+        return None, None
+    best_window = None
+    best_secs: "float | None" = None
+    for window in _RL_KNOWN_WINDOWS:
+        status = headers.get(_rl_status_for(window))
+        if not status or status.strip().lower() != "throttled":
+            continue
+        raw = headers.get(_rl_reset_for(window))
+        if not raw:
+            continue
+        secs = _rl_parse_timestamp(raw, now)
+        if secs is None:
+            continue
+        if best_secs is None or secs > best_secs:
+            best_window, best_secs = window, secs
+    return best_window, best_secs
+
+
+def _rl_seconds_until_reset(exc: Exception) -> "tuple":
+    """Parse a 429's reset info into ``(window_name, seconds_until_reset)``.
+
+    Detection order:
+      1. ``anthropic-ratelimit-unified-{7d,1d,5h}-status=throttled`` plus the
+         matching ``-reset`` header (window-aware — preferred when present).
+      2. ``retry-after`` (RFC 7231: delta-seconds or HTTP-date) — windowless.
+      3. ``anthropic-ratelimit-unified-reset`` (epoch seconds or RFC 3339).
+      4. Any other ``anthropic-ratelimit-*-reset`` (we keep the longest).
+
+    ``window_name`` is one of ``"7d"``, ``"1d"``, ``"5h"``, or ``None`` when
+    we can't tell which window tripped (e.g. only ``retry-after`` was set).
+    The returned ``seconds_until_reset`` is the value to sleep, *already
+    bounded to be non-negative* — callers still need to apply the per-window
+    safety cap.
+    """
     import email.utils as _eut
 
     headers = _rl_parse_headers(exc)
     if not headers:
-        return None
+        return None, None
     now = time.time()
 
-    def _from_timestamp_or_rfc3339(raw: str) -> "float | None":
-        raw = (raw or "").strip()
-        if not raw:
-            return None
-        # epoch seconds (Anthropic unified-reset is usually a Unix timestamp)
-        try:
-            ts = float(raw)
-            # If it looks like an absolute epoch (in the future), use delta;
-            # if it's a small number, treat as a relative duration.
-            if ts > 1_000_000_000:  # ~2001+, clearly absolute epoch seconds
-                return max(0.0, ts - now)
-            return max(0.0, ts)
-        except ValueError:
-            pass
-        # RFC 3339 / ISO 8601
-        try:
-            iso = raw.replace("Z", "+00:00")
-            dt = _dt.datetime.fromisoformat(iso)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            return max(0.0, dt.timestamp() - now)
-        except Exception:
-            return None
+    # 1. window-aware: if Anthropic told us which window throttled us,
+    #    trust the matching reset header.
+    window, secs = _rl_detect_throttled_window(headers, now)
+    if window is not None and secs is not None:
+        return window, secs
 
-    # 1. retry-after
+    # 2. retry-after (windowless — works for any provider that sets it)
     ra = headers.get("retry-after")
     if ra:
         ra = ra.strip()
         try:
-            return max(0.0, float(ra))  # delta-seconds
+            return None, max(0.0, float(ra))  # delta-seconds
         except ValueError:
             try:  # HTTP-date
                 parsed = _eut.parsedate_to_datetime(ra)
                 if parsed is not None:
-                    return max(0.0, parsed.timestamp() - now)
+                    return None, max(0.0, parsed.timestamp() - now)
             except Exception:
                 pass
 
-    # 2 + 3. anthropic-ratelimit-*-reset (unified first, then any other)
+    # 3 + 4. anthropic-ratelimit-*-reset (unified first, then any other)
     unified = headers.get("anthropic-ratelimit-unified-reset")
     if unified:
-        secs = _from_timestamp_or_rfc3339(unified)
+        secs = _rl_parse_timestamp(unified, now)
         if secs is not None:
-            return secs
+            return None, secs
     candidates = [
         v for k, v in headers.items()
         if k.startswith("anthropic-ratelimit-") and k.endswith("-reset")
     ]
     best = None
     for raw in candidates:
-        secs = _from_timestamp_or_rfc3339(raw)
+        secs = _rl_parse_timestamp(raw, now)
         if secs is not None:
             best = secs if best is None else max(best, secs)
-    return best
+    return None, best
 
 
 def _rl_fmt_eta(seconds: float) -> str:
@@ -1355,15 +1445,50 @@ def _rl_interrupted(agent: Any) -> bool:
         return False
 
 
+# Per-window safety caps.  These are independent of the legacy
+# ``HERMES_RL_AUTOWAIT_MAX_S`` knob: when Anthropic tells us *which* window
+# tripped (via ``anthropic-ratelimit-unified-{5h,1d,7d}-status``), we use
+# the matching cap; otherwise we fall back to ``HERMES_RL_AUTOWAIT_MAX_S``.
+# Defaults (all in seconds):
+#   5h → 6h  (current behaviour — short enough that the gateway watchdog
+#             can be tuned up if needed, but long enough to span any 5h window)
+#   1d → 26h (daily cap with a 2h buffer for clock drift / reset skew)
+#   7d → 7.5d (≈648000s — weekly Anthropic Pro reset + 12h safety)
+_RL_WINDOW_DEFAULTS_S: dict = {
+    "5h": 6 * 3600,         # 21600
+    "1d": 26 * 3600,        # 93600
+    "7d": int(7.5 * 86400),  # 648000
+}
+_RL_WINDOW_LABEL: dict = {
+    "5h": "5-часового (Pro/Max)",
+    "1d": "суточного (1d)",
+    "7d": "недельного (7d)",
+}
+
+
+def _rl_window_cap(window: "str | None") -> int:
+    """Return the per-window safety cap in seconds.
+
+    ``window`` is one of ``"5h"``/``"1d"``/``"7d"`` (Anthropic's exact
+    suffix) or ``None`` (caller couldn't tell which window tripped — we
+    fall back to the legacy ``HERMES_RL_AUTOWAIT_MAX_S`` knob, default 6h).
+    """
+    if window is not None and window in _RL_WINDOW_DEFAULTS_S:
+        return _rl_env_int(
+            f"HERMES_RL_AUTOWAIT_MAX_{window.upper()}_S",
+            _RL_WINDOW_DEFAULTS_S[window],
+        )
+    return _rl_env_int("HERMES_RL_AUTOWAIT_MAX_S", 21600)  # 6h fallback
+
+
 def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
     """Sleep until the rate-limit window resets.  Returns True if we waited
     (caller should retry), False if we should re-raise (cap hit / interrupted /
     unparseable with auto-wait disabled)."""
-    max_wait = _rl_env_int("HERMES_RL_AUTOWAIT_MAX_S", 21600)      # 6h safety cap
     buffer_s = _rl_env_int("HERMES_RL_AUTOWAIT_BUFFER_S", 5)
     default_s = _rl_env_int("HERMES_RL_AUTOWAIT_DEFAULT_S", 300)
 
-    reset = _rl_seconds_until_reset(exc)
+    window, reset = _rl_seconds_until_reset(exc)
     if reset is None:
         # No parseable reset header.  Use a conservative default so we still
         # recover from subscription-window 429s that omit the header.
@@ -1371,26 +1496,32 @@ def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
         had_header = False
     else:
         had_header = True
+    max_wait = _rl_window_cap(window)
     wait_s = min(reset + buffer_s, float(max_wait))
 
     if wait_s <= 0:
         return True  # already reset — retry immediately
 
     if reset + buffer_s > max_wait:
+        label = _RL_WINDOW_LABEL.get(window or "", "лимита") if window else "лимита"
         _rl_emit(
             agent,
-            f"⏱️ Лимит Claude исчерпан, но сброс через "
-            f"{_rl_fmt_eta(reset)} — это больше safety-cap "
-            f"({_rl_fmt_eta(max_wait)}). Останавливаюсь.",
+            f"⏱️ {label.capitalize() if label[0].islower() else label} Claude "
+            f"исчерпан, но сброс через {_rl_fmt_eta(reset)} — это больше "
+            f"safety-cap ({_rl_fmt_eta(max_wait)}). Останавливаюсь.",
         )
         return False
 
     eta = _rl_fmt_eta(wait_s)
     clock = _rl_local_clock(wait_s)
     src = "" if had_header else " (оценка)"
+    if window and window in _RL_WINDOW_LABEL:
+        window_msg = f" ({_RL_WINDOW_LABEL[window]})"
+    else:
+        window_msg = ""
     _rl_emit(
         agent,
-        f"⏸ Лимит Claude исчерпан. Жду сброса окна ≈{eta}{src} "
+        f"⏸ Лимит Claude{window_msg} исчерпан. Жду сброса окна ≈{eta}{src} "
         f"(продолжу примерно в {clock}). Засыпаю…",
     )
 
@@ -1399,7 +1530,8 @@ def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
     # the liveness signal every ~25s inside the chunk loop — well under
     # the default gateway_timeout (1800s) and gateway_timeout_warning
     # (900s), so neither the warning nor the kill fires.
-    _rl_touch(agent, f"auto-waiting for Claude rate-limit reset (≈{eta})")
+    touch_desc = f"auto-waiting for Claude {window or 'unified'} rate-limit reset (≈{eta})"
+    _rl_touch(agent, touch_desc)
     last_touch = time.monotonic()
     _TOUCH_INTERVAL_S = 25.0
 
@@ -1419,7 +1551,8 @@ def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
             remaining_str = _rl_fmt_eta(max(0.0, deadline - time.time()))
             _rl_touch(
                 agent,
-                f"auto-waiting for Claude rate-limit reset (≈{remaining_str} left)",
+                f"auto-waiting for Claude {window or 'unified'} rate-limit reset "
+                f"(≈{remaining_str} left)",
             )
 
     _rl_emit(agent, "▶ Лимит сброшен — продолжаю выполнение.")
