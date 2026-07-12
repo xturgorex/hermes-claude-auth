@@ -16,10 +16,10 @@ On 2026-04-04, Anthropic added server-side validation that rejects OAuth request
 ## Install
 ```bash
 # Remote install (one-liner)
-curl -fsSL https://raw.githubusercontent.com/Meapri/hermes-claude-auth/main/install-remote.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
 
 # Or clone manually
-git clone https://github.com/Meapri/hermes-claude-auth.git
+git clone https://github.com/kristianvast/hermes-claude-auth.git
 cd hermes-claude-auth
 ./install.sh
 ```
@@ -40,7 +40,7 @@ You are setting up hermes-claude-auth on this machine.
 Work from the persistent clone at ~/hermes-claude-auth. If it exists and is
 clean, run `git pull`; if it has local changes, do not overwrite them and
 report that pull was skipped. If it does not exist, run:
-`git clone https://github.com/Meapri/hermes-claude-auth.git ~/hermes-claude-auth`
+`git clone https://github.com/kristianvast/hermes-claude-auth.git ~/hermes-claude-auth`
 
 Then run:
 `cd ~/hermes-claude-auth && ./install.sh`
@@ -156,7 +156,7 @@ Only `sitecustomize.py` needs recovery. `--post-update` does exactly that.
 
 ### Coexisting with the Google Antigravity plugin
 
-If [hermes-google-antigravity-plugin](https://github.com/Meapri/hermes-google-antigravity-plugin)
+If [hermes-google-antigravity-plugin](https://github.com/kristianvast/hermes-google-antigravity-plugin)
 is also installed, both share a single `sitecustomize.py` that carries **all 11
 import hooks** (2 Claude + 9 Antigravity). Two cautions:
 
