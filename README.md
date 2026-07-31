@@ -38,28 +38,52 @@ What `install.sh` does:
 
 ## Surviving `hermes update` (auto-recovery)
 
-`hermes update` runs `git merge --ff-only` + `uv pip install`, which can
-wipe the loader from the venv's `site-packages/`. To restore it automatically
-after every update, install the bundled `post-merge` hook into **the
-hermes-agent repo** (not this one):
+`hermes update` can wipe the loader from the venv's `site-packages/` in two
+ways:
+
+1. **`git merge` / `git checkout`** of the hermes-agent repo — triggers git
+   hooks, but the default `.git/hooks/` dir is *inside* the repo and gets
+   **stashed** by the update's `git stash` step, so hooks there don't fire at
+   the right time.
+2. **Venv rebuild** — the update provisions a fresh Python runtime, which
+   deletes `sitecustomize.py` outright. No git hook covers this.
+
+### Two-layer defense
+
+**Layer 1 — git hooks via `core.hooksPath` (outside the repo):**
 
 ```bash
 # From inside your hermes-agent checkout:
-cp /path/to/hermes-claude-auth/post-merge.hook.sh .git/hooks/post-merge
-chmod +x .git/hooks/post-merge
+mkdir -p "$LOCALAPPDATA/hermes/git-hooks"
+cp post-merge.hook.sh "$LOCALAPPDATA/hermes/git-hooks/post-merge"
+cp post-checkout.hook.sh "$LOCALAPPDATA/hermes/git-hooks/post-checkout"
+chmod +x "$LOCALAPPDATA/hermes/git-hooks/post-"*
+git config core.hooksPath "$LOCALAPPDATA/hermes/git-hooks"
 ```
 
-The hook copies `sitecustomize_hook.py` (kept as the canonical loader at
-`$HERMES_HOME/patches/sitecustomize.py`) back into the venv after each pull.
-It is idempotent and never breaks the update — if anything is off, it logs to
-stderr and returns 0.
+Because the hooks live *outside* `.git/hooks/`, the update's `git stash`
+can't touch them, and `core.hooksPath` makes git use them for every
+merge/checkout.
 
-For a full two-way setup (so pulling *this* repo also re-installs), copy the
-same file into this repo's `.git/hooks/post-merge` as well.
+**Layer 2 — watchdog cron (covers venv rebuild):**
 
-> **Note:** Windows users — the hook is a POSIX shell script. It runs under
-> Git Bash (which ships with Git for Windows) and is invoked by git's own
-> hook runner, so no extra setup is needed.
+```bash
+# Hermes cron runs restore_loader.sh every 15m; it re-copies the loader
+# from $LOCALAPPDATA/hermes/patches/sitecustomize.py if it's missing.
+hermes cron create "every 15m" --name restore-claude-auth-loader \
+  --no-agent --script restore_loader.sh --deliver local
+```
+
+The cron job only fires while the Hermes gateway is running — after an update,
+the loader is restored within ≤15 minutes of the gateway coming back up.
+
+Both layers are idempotent and never break the update. The canonical loader
+lives at `$LOCALAPPDATA/hermes/patches/sitecustomize.py` (outside any repo).
+
+> **Windows note:** hooks are POSIX shell scripts run under Git Bash (ships
+> with Git for Windows). The cron script uses `uname` to resolve paths and
+> works under the Hermes gateway's environment.
+
 
 
 1. **Billing header**: SHA-256 signed `x-anthropic-billing-header` injected as `system[0]`
