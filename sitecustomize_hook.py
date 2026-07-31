@@ -21,10 +21,53 @@ from __future__ import annotations
 import os
 import sys
 
-_PATCHES_DIR = os.environ.get(
-    "HERMES_PATCHES_DIR",
-    os.path.expanduser("~/.hermes/patches"),
-)
+def _resolve_patches_dir() -> str:
+    """Locate ``anthropic_billing_bypass.py`` across Hermes install layouts.
+
+    Hermes supports multiple profiles under
+    ``$HERMES_HOME/profiles/<name>/`` (e.g. ``default``, ``casa``,
+    ``alldrivers-*``).  The billing bypass is installed **once** at the
+    Hermes data root (``$HERMES_HOME/patches/``), not per profile, yet
+    ``HERMES_HOME`` may legitimately point at a profile directory.  Resolve
+    in this order, taking the first path that actually contains the patch:
+
+      1. ``$HERMES_PATCHES_DIR``            (explicit override, wins outright)
+      2. ``$HERMES_HOME``                  (when HERMES_HOME holds patches/)
+      3. ``$HERMES_HOME/../..``            (when HERMES_HOME is a profile dir:
+                                            ``.../profiles/<name>`` → data root)
+      4. ``%LOCALAPPDATA%/hermes``         (Windows native default)
+      5. ``~/.hermes``                     (POSIX default)
+
+    Falls back to the legacy ``~/.hermes/patches`` if none match, so the
+    behaviour is unchanged for single-profile installs.
+    """
+    explicit = os.environ.get("HERMES_PATCHES_DIR")
+    if explicit:
+        return explicit
+
+    candidates = []
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        candidates.append(home)
+        # HERMES_HOME = .../hermes/profiles/<name>  → data root is two levels up
+        if os.path.basename(os.path.dirname(home)).lower() == "profiles":
+            candidates.append(os.path.dirname(os.path.dirname(home)))
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        candidates.append(os.path.join(localappdata, "hermes"))
+    candidates.append(os.path.expanduser("~/.hermes"))
+
+    patch_name = "anthropic_billing_bypass.py"
+    for cand in candidates:
+        if not cand or not os.path.isdir(cand):
+            continue
+        if os.path.isfile(os.path.join(cand, "patches", patch_name)):
+            return os.path.join(cand, "patches")
+    # Fallback: legacy single-profile default.
+    return os.path.expanduser("~/.hermes/patches")
+
+
+_PATCHES_DIR = _resolve_patches_dir()
 _TARGET_MODULE = "agent.anthropic_adapter"
 
 if os.path.isdir(_PATCHES_DIR) and _PATCHES_DIR not in sys.path:

@@ -49,6 +49,51 @@ What `install.sh` does:
 
 Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interpreter startup with no source modifications.
 
+## Subscription rate-limit auto-wait (Claude Pro/Max windows: 5h, 1d, 7d)
+
+When a long agent run exhausts a Claude Pro/Max usage window mid-flight,
+api.anthropic.com returns HTTP 429 with a reset time in the
+`anthropic-ratelimit-unified-*-reset` headers.  Hermes core's retry loop
+caps backoff at 120s and abandons the run, surfacing "rate-limiting
+requests" on Telegram and killing the session.
+
+This patch wraps the two API-call entry points on `run_agent.AIAgent` so a
+genuine subscription-window 429 instead **sleeps until the window resets**
+(interruptibly, in short chunks) and then retries the same call transparently.
+It picks the **longest** throttled window (e.g. a 7d hit also clears the 5h
+window, so a single sleep covers both) and applies a **per-window** safety
+cap (5h=6h, 1d=26h, 7d=7.5d). Behaviour is tunable via env vars:
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `HERMES_RL_AUTOWAIT` | `1` | `0` disables auto-wait entirely |
+| `HERMES_RL_AUTOWAIT_MAX_S` | `21600` | fallback cap (s) when no window detected |
+| `HERMES_RL_AUTOWAIT_MAX_5H_S` | `21600` | 5h-window safety cap (6h) |
+| `HERMES_RL_AUTOWAIT_MAX_1D_S` | `93600` | 1d-window safety cap (26h) |
+| `HERMES_RL_AUTOWAIT_MAX_7D_S` | `648000` | 7d-window safety cap (7.5d) |
+| `HERMES_RL_AUTOWAIT_BUFFER_S` | `5` | pad added after reset |
+| `HERMES_RL_AUTOWAIT_DEFAULT_S` | `300` | wait when no reset header found |
+
+The wait loop also calls `agent._touch_activity(...)` every ~25s so the
+gateway's inactivity watchdog doesn't kill the agent mid-wait.  Idempotent
+and never breaks the billing path: if anything goes wrong, the original
+call/exception behaviour is preserved.
+
+Ported from kristianvast/hermes-claude-auth PR #27 (window-aware auto-wait);
+the fingerprint parity fix below from PR #21.
+
+## Fingerprint parity (avoids "extra usage" billing)
+
+Anthropic's validator cross-references the `user-agent` header and the
+`cc_version=` field in the billing header.  If the SDK client sends
+`claude-cli/<ver> (external, cli)` while the billing header claims
+`cc_entrypoint=sdk-cli`, the request is flagged as third-party and routed to
+pay-per-token **extra usage** instead of your Max/Pro plan
+(`HTTP 400 You're out of extra usage`).  This patch pins the Claude Code
+version to `2.1.112` for **both** the user-agent and the signed billing
+header, and forces `x-app: cli`, eliminating the drift that triggered
+upstream issue #6.
+
 ## What gets modified
 | File | Action |
 |------|--------|
@@ -58,15 +103,21 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 
 ## Compatibility
 - Tested with hermes-agent on Python 3.11+
-- Linux and macOS
+- Linux, macOS, and **Windows** (native: `%LOCALAPPDATA%\hermes`; the bypass
+  patch lives at `%LOCALAPPDATA%\hermes\patches\anthropic_billing_bypass.py`)
+- **Multiple profiles**: Hermes supports `profiles/<name>/` under the data
+  root. The patch is installed once at the data root and shared by every
+  profile; `HERMES_HOME` may point at a profile dir and the loader still
+  resolves the patch correctly.
 - Depends on `build_anthropic_kwargs(is_oauth=...)` in `agent.anthropic_adapter`, so it may need updating if hermes-agent changes that interface
 
 ## Troubleshooting
 
 ### Install issues
-- **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/`
+- **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/` (Linux/macOS) or `%LOCALAPPDATA%\hermes\hermes-agent\` (Windows)
 - **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
-- **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **"ModuleNotFoundError: No module named 'anthropic_billing_bypass'"** on every startup: the `sitecustomize.py` hook couldn't find the patch. This happens when `HERMES_HOME` points at a **profile** directory (`.../hermes/profiles/<name>`) but the patch lives at the data root. This build resolves that case automatically — reinstall the hook from this repo (`install.sh`) or copy `sitecustomize_hook.py` into the venv's `site-packages/` as `sitecustomize.py`.
+- **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` (Linux) or the Hermes log under `%LOCALAPPDATA%\hermes\logs\` (Windows) for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
 
 ### Auth issues
 
