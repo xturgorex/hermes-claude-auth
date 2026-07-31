@@ -186,6 +186,27 @@ billing pay-per-token:
 > This replaces the static pin from upstream PR #21 and removes the drift that
 > triggered issue #6.
 
+## Known limitations (upstream PRs not yet ported)
+
+This fork intentionally does **not** include some open upstream PRs. Status:
+
+- **PR #23** (thinking replay / tool repair hardening, +1296): fixes HTTP 400 on
+  mutated `thinking` / `redacted_thinking` blocks in long Opus conversations.
+  Not ported — large diff against our `v1.5.1+rl-autodetect` base and our
+  bypass already strips `thinking['effort']` + temperature. If you hit HTTP 400
+  with `thinking` blocks, port `_strip_thinking_from_replay` from #23.
+- **PR #24** (full Windows + Credential Manager mirroring, +437): not ported —
+  conflicts with our profile-aware loader (Fix A) and our two-layer auto-recovery
+  already covers Windows installs + venv rebuilds. Only the `.ps1` installers
+  would be additive; not needed since `core.hooksPath` + cron handle it.
+- **PR #15 / #10** (wire-format 2.1.117 / 2.1.123): not ported — our dynamic
+  version detection already advertises whatever Claude Code is actually
+  installed, so we're never behind the wire format.
+- **PR #20** (per-pool `account_uuid`): only relevant for multi-account Claude
+  credential pools; single-account setups don't need it.
+- **PR #16** (.pth shim for Debian/Ubuntu apport): only relevant on Debian/Ubuntu
+  where a system `sitecustomize.py` wins import priority; Windows/macOS unaffected.
+
 
 
 ### Install issues
