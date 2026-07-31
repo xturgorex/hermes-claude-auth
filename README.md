@@ -154,13 +154,13 @@ billing pay-per-token:
 3. **Token flow** — calls should succeed with `provider=anthropic` in
    `agent.log` and normal in/out token counts (not 429s).
 
-> **Version pin note:** This build pins Claude Code `2.1.112` for the
-> user-agent + signed billing header. The real Claude Code on your machine may
-> be newer (e.g. `2.1.186`); the upstream project intentionally stays on
-> `2.1.112` because the validator still accepts it. If Anthropic tightens the
-> wire-format check, bump `_PINNED_CC_VERSION` in `anthropic_billing_bypass.py`
-> and re-test. Track upstream PRs #10 (2.1.123) and #15 (2.1.117) for the
-> newer wire-format parity if needed.
+> **Dynamic version detection:** This build detects the installed Claude Code
+> version automatically (via `claude --version`) and uses it for both the
+> user-agent and the signed billing header. No manual pinning — when you
+> update Claude Code, the bypass follows on the next Hermes start. Falls back
+> to `_PINNED_CC_VERSION` (`2.1.112`) only if Claude Code isn't on PATH.
+> This replaces the static pin from upstream PR #21 and removes the drift that
+> triggered issue #6.
 
 
 

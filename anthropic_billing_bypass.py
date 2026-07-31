@@ -37,7 +37,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.1+rl-autowait"
+__version__ = "1.5.1+rl-autodetect"
 
 import hashlib
 import inspect
@@ -82,14 +82,50 @@ _MCP_HERMES_NAMESPACE = "mcp__hermes__"
 _STAINLESS_PACKAGE_VERSION = "0.81.0"
 _STAINLESS_NODE_VERSION = "v22.11.0"
 
-# Pinned CC version used for BOTH the billing-header signature AND the
-# user-agent header.  Anthropic's validator cross-references these; a
-# mismatch (e.g. hermes detecting an installed older Claude CLI while the
-# billing header claims cc_entrypoint=sdk-cli which is a 2.1.112+ thing)
-# flags the request as third-party and routes traffic to extra usage.
+# Fallback CC version used for BOTH the billing-header signature AND the
+# user-agent header when dynamic detection fails (e.g. Claude CLI not on
+# PATH).  Anthropic's validator cross-references these; a mismatch flags the
+# request as third-party and routes traffic to extra usage.
 # Ported from kristianvast/hermes-claude-auth PR #21, which mirrors
 # griffinmartin/opencode-claude-auth PR #207 (``ccVersion: "2.1.112"``).
 _PINNED_CC_VERSION = "2.1.112"
+
+# Cache for the dynamically detected Claude Code version.
+_CC_VERSION_CACHE: Optional[str] = None
+
+
+def _detect_local_claude_version() -> str:
+    """Detect the installed Claude Code version from the local binary.
+
+    Runs ``claude --version`` (and ``claude-code --version`` as a fallback)
+    and parses the leading ``X.Y.Z`` token.  Returns the fallback pin if the
+    binary is missing or the output is unparseable.  Cached after first call.
+    """
+    global _CC_VERSION_CACHE
+    if _CC_VERSION_CACHE is not None:
+        return _CC_VERSION_CACHE
+    import subprocess as _sp
+    for cmd in ("claude", "claude-code"):
+        try:
+            result = _sp.run(
+                [cmd, "--version"],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                version = result.stdout.strip().split()[0]
+                if version and version[0].isdigit():
+                    _CC_VERSION_CACHE = version
+                    return version
+        except Exception:
+            pass
+    _CC_VERSION_CACHE = _PINNED_CC_VERSION
+    return _CC_VERSION_CACHE
+
+
+def _local_claude_version() -> str:
+    """Public accessor: the version to advertise in headers + billing signature."""
+    return _detect_local_claude_version()
 
 # OAuth-only beta flags appended on top of hermes-agent's built-in
 # ``claude-code-20250219`` and ``oauth-2025-04-20``.
@@ -324,7 +360,7 @@ def _merge_spoof_extras(api_kwargs: Dict[str, Any]) -> None:
     # on the SDK client; the existing_headers loop above would otherwise let
     # hermes's "(external, cli)" win and break fingerprint parity.
     merged_headers["user-agent"] = (
-        f"claude-cli/{_PINNED_CC_VERSION} (external, sdk-cli)"
+        f"claude-cli/{_local_claude_version()} (external, sdk-cli)"
     )
     merged_headers["x-app"] = "cli"
     api_kwargs["extra_headers"] = merged_headers
@@ -628,16 +664,22 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
 def _get_version_safely(aa_module: Any) -> str:
     """Return the Claude Code version used to sign the billing header.
 
-    Pinned to ``_PINNED_CC_VERSION`` so the billing header's ``cc_version=``
-    and the user-agent's ``claude-cli/<version>`` always agree.  Detecting
-    hermes's installed Claude CLI dynamically lets the two drift apart the
-    moment hermes lags behind upstream, which trips Anthropic's third-party
-    validator and bills to extra usage.  ``aa_module`` is preserved in the
-    signature so the monkey-patch glue continues to type-check.
+    Detects the *installed* Claude Code version dynamically (via
+    ``claude --version``) so the billing header's ``cc_version=`` and the
+    user-agent's ``claude-cli/<version>`` always match the local binary —
+    never drifting behind it.  This is what keeps Anthropic's third-party
+    validator happy and routes to the subscription bucket instead of extra
+    usage.
 
-    Ported from hermes-claude-auth PR #21 / upstream #207.
+    Falls back to ``_PINNED_CC_VERSION`` if detection fails (e.g. Claude Code
+    not on PATH), so the patch never hard-fails.
+
+    Ported from hermes-claude-auth PR #21 / upstream #207, with dynamic
+    detection replacing the static pin.
     """
-    del aa_module  # unused; kept for signature compatibility
+    detected = _local_claude_version()
+    if detected and detected[0].isdigit():
+        return detected
     return _PINNED_CC_VERSION
 
 
