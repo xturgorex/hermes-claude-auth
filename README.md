@@ -136,7 +136,33 @@ upstream issue #6.
   resolves the patch correctly.
 - Depends on `build_anthropic_kwargs(is_oauth=...)` in `agent.anthropic_adapter`, so it may need updating if hermes-agent changes that interface
 
-## Troubleshooting
+## Verifying the bypass is active (not falling back to extra usage)
+
+After install, confirm Hermes is using the subscription path and not silently
+billing pay-per-token:
+
+1. **Startup log** — look for these lines in the Hermes gateway log
+   (`%LOCALAPPDATA%\hermes\logs\` on Windows):
+   ```
+   [anthropic_billing_bypass] Bypass installed
+   [anthropic_billing_bypass] Transport unwrap hook installed
+   [anthropic_billing_bypass] Rate-limit auto-wait installed
+   ```
+2. **No `extra usage` errors** — if you see `HTTP 400 You're out of extra
+   usage` or `HTTP 429 ... extra usage required`, the fingerprint drifted and
+   the request was routed to the pay-per-token bucket. Re-run `install.sh`.
+3. **Token flow** — calls should succeed with `provider=anthropic` in
+   `agent.log` and normal in/out token counts (not 429s).
+
+> **Version pin note:** This build pins Claude Code `2.1.112` for the
+> user-agent + signed billing header. The real Claude Code on your machine may
+> be newer (e.g. `2.1.186`); the upstream project intentionally stays on
+> `2.1.112` because the validator still accepts it. If Anthropic tightens the
+> wire-format check, bump `_PINNED_CC_VERSION` in `anthropic_billing_bypass.py`
+> and re-test. Track upstream PRs #10 (2.1.123) and #15 (2.1.117) for the
+> newer wire-format parity if needed.
+
+
 
 ### Install issues
 - **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/` (Linux/macOS) or `%LOCALAPPDATA%\hermes\hermes-agent\` (Windows)
