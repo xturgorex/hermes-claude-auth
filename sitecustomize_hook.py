@@ -3,8 +3,8 @@ sitecustomize hook — Claude Code OAuth bypass for hermes-agent.
 ===============================================================
 
 This file is installed into the hermes-agent venv's site-packages as
-``sitecustomize.py`` by ``install.sh``.  It runs once at Python interpreter
-startup (before any user code) and hooks the import of
+``sitecustomize.py`` by ``install.sh`` or ``install.ps1``.  It runs once
+at Python interpreter startup (before any user code) and hooks the import of
 ``agent.anthropic_adapter`` so that the billing bypass patch is applied
 immediately after the module loads.
 
@@ -21,50 +21,61 @@ from __future__ import annotations
 import os
 import sys
 
-def _resolve_patches_dir() -> str:
-    """Locate ``anthropic_billing_bypass.py`` across Hermes install layouts.
+def _candidate_hermes_homes() -> list[str]:
+    """Return every plausible Hermes data dir, most specific first.
 
-    Hermes supports multiple profiles under
-    ``$HERMES_HOME/profiles/<name>/`` (e.g. ``default``, ``casa``,
-    ``alldrivers-*``).  The billing bypass is installed **once** at the
-    Hermes data root (``$HERMES_HOME/patches/``), not per profile, yet
-    ``HERMES_HOME`` may legitimately point at a profile directory.  Resolve
-    in this order, taking the first path that actually contains the patch:
-
-      1. ``$HERMES_PATCHES_DIR``            (explicit override, wins outright)
-      2. ``$HERMES_HOME``                  (when HERMES_HOME holds patches/)
-      3. ``$HERMES_HOME/../..``            (when HERMES_HOME is a profile dir:
-                                            ``.../profiles/<name>`` → data root)
-      4. ``%LOCALAPPDATA%/hermes``         (Windows native default)
-      5. ``~/.hermes``                     (POSIX default)
-
-    Falls back to the legacy ``~/.hermes/patches`` if none match, so the
-    behaviour is unchanged for single-profile installs.
+    ``HERMES_HOME`` may point at a *profile* directory
+    (``...\\hermes\\profiles\\<name>``) rather than the install root.
+    Patches are installed once at the root, so a profile-scoped
+    HERMES_HOME must still fall back to the root — otherwise the
+    bypass silently fails to import (ModuleNotFoundError).
     """
+    homes: list[str] = []
+
+    def _add(path: str | None) -> None:
+        if path:
+            p = os.path.abspath(os.path.expanduser(path))
+            if p not in homes:
+                homes.append(p)
+
+    configured = os.environ.get("HERMES_HOME")
+    _add(configured)
+
+    # If HERMES_HOME is a profile dir, walk up past 'profiles/<name>'.
+    if configured:
+        p = os.path.abspath(os.path.expanduser(configured))
+        parent = os.path.dirname(p)
+        if os.path.basename(parent).lower() == "profiles":
+            _add(os.path.dirname(parent))
+
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            _add(os.path.join(local_app_data, "hermes"))
+    _add("~/.hermes")
+    return homes
+
+
+def _default_hermes_home() -> str:
+    """Backwards-compatible single-value resolver."""
+    homes = _candidate_hermes_homes()
+    return homes[0] if homes else os.path.expanduser("~/.hermes")
+
+
+def _resolve_patches_dir() -> str:
+    """Pick the first patches dir that actually contains the bypass module."""
     explicit = os.environ.get("HERMES_PATCHES_DIR")
     if explicit:
-        return explicit
+        return os.path.expanduser(explicit)
 
-    candidates = []
-    home = os.environ.get("HERMES_HOME")
-    if home:
-        candidates.append(home)
-        # HERMES_HOME = .../hermes/profiles/<name>  → data root is two levels up
-        if os.path.basename(os.path.dirname(home)).lower() == "profiles":
-            candidates.append(os.path.dirname(os.path.dirname(home)))
-    localappdata = os.environ.get("LOCALAPPDATA")
-    if localappdata:
-        candidates.append(os.path.join(localappdata, "hermes"))
-    candidates.append(os.path.expanduser("~/.hermes"))
-
-    patch_name = "anthropic_billing_bypass.py"
-    for cand in candidates:
-        if not cand or not os.path.isdir(cand):
-            continue
-        if os.path.isfile(os.path.join(cand, "patches", patch_name)):
-            return os.path.join(cand, "patches")
-    # Fallback: legacy single-profile default.
-    return os.path.expanduser("~/.hermes/patches")
+    fallback = None
+    for home in _candidate_hermes_homes():
+        cand = os.path.join(home, "patches")
+        if fallback is None:
+            fallback = cand
+        if os.path.isfile(os.path.join(cand, "anthropic_billing_bypass.py")):
+            return cand
+    return fallback or os.path.join(_default_hermes_home(), "patches")
 
 
 _PATCHES_DIR = _resolve_patches_dir()

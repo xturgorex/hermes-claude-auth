@@ -36,7 +36,32 @@ What `install.sh` does:
 ./uninstall.sh --purge  # remove hook + patch file
 ```
 
-## How it works
+## Surviving `hermes update` (auto-recovery)
+
+`hermes update` runs `git merge --ff-only` + `uv pip install`, which can
+wipe the loader from the venv's `site-packages/`. To restore it automatically
+after every update, install the bundled `post-merge` hook into **the
+hermes-agent repo** (not this one):
+
+```bash
+# From inside your hermes-agent checkout:
+cp /path/to/hermes-claude-auth/post-merge.hook.sh .git/hooks/post-merge
+chmod +x .git/hooks/post-merge
+```
+
+The hook copies `sitecustomize_hook.py` (kept as the canonical loader at
+`$HERMES_HOME/patches/sitecustomize.py`) back into the venv after each pull.
+It is idempotent and never breaks the update — if anything is off, it logs to
+stderr and returns 0.
+
+For a full two-way setup (so pulling *this* repo also re-installs), copy the
+same file into this repo's `.git/hooks/post-merge` as well.
+
+> **Note:** Windows users — the hook is a POSIX shell script. It runs under
+> Git Bash (which ships with Git for Windows) and is invoked by git's own
+> hook runner, so no extra setup is needed.
+
+
 1. **Billing header**: SHA-256 signed `x-anthropic-billing-header` injected as `system[0]`
 2. **System prompt relocation**: Non-identity system entries moved to the first user message as `<system-reminder>` blocks
 3. **Beta flags**: Adds `prompt-caching-scope-2026-01-05` and `advisor-tool-2026-03-01`
