@@ -40,7 +40,7 @@ import sys
 
 _PATCHES_DIR = os.environ.get(
     "HERMES_PATCHES_DIR",
-    os.path.expanduser("~/.hermes/patches"),
+    os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "patches"),
 )
 _TARGET_MODULE = "agent.anthropic_adapter"
 

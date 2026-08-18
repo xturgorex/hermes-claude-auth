@@ -6,9 +6,10 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 RESET='\033[0m'
 
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HERMES_AGENT_DIR="$HOME/.hermes/hermes-agent"
-PATCHES_DIR="$HOME/.hermes/patches"
+HERMES_AGENT_DIR="$HERMES_HOME/hermes-agent"
+PATCHES_DIR="$HERMES_HOME/patches"
 MARKER="# hermes-claude-auth managed"
 BOOTSTRAP_NAME="_hermes_claude_auth_bootstrap.py"
 PTH_NAME="hermes_claude_auth.pth"
@@ -109,7 +110,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     if KEYCHAIN_CRED="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)"; then
         mkdir -p "$(dirname "$CRED_FILE")"
         if [ ! -f "$CRED_FILE" ] || [ "$(cat "$CRED_FILE" 2>/dev/null)" != "$KEYCHAIN_CRED" ]; then
-            printf '%s' "$KEYCHAIN_CRED" > "$CRED_FILE"
+            printf '%s' "$KEYCHAIN_CRED" >"$CRED_FILE"
             chmod 600 "$CRED_FILE"
             printf "${GREEN}[✓] Mirrored Claude Code credentials from Keychain → %s${RESET}\n" "$CRED_FILE"
         else

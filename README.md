@@ -8,9 +8,9 @@ Patches hermes-agent at runtime to pass Anthropic's server-side OAuth content va
 On 2026-04-04, Anthropic added server-side validation that rejects OAuth requests from third-party tools. This patch adds the billing header signature and system prompt structure the API expects.
 
 ## Prerequisites
-- hermes-agent installed (`~/.hermes/hermes-agent/`)
+- hermes-agent installed (`$HERMES_HOME/hermes-agent/`, defaults to `~/.hermes/hermes-agent/`)
 - Claude Code CLI authenticated (valid credentials at `~/.claude/.credentials.json`)
-- hermes-agent configured for OAuth (`credential_pool` has a `claude_code` entry in `~/.hermes/auth.json`)
+- hermes-agent configured for OAuth (`credential_pool` has a `claude_code` entry in `$HERMES_HOME/auth.json`)
 - Python 3.11+
 
 ## Install
@@ -26,7 +26,7 @@ cd hermes-claude-auth
 ```
 
 What `install.sh` does:
-- Copies `anthropic_billing_bypass.py` to `~/.hermes/patches/`
+- Copies `anthropic_billing_bypass.py` to `$HERMES_HOME/patches/` (defaults to `~/.hermes/patches/`)
 - Installs a `.pth` shim + bootstrap module into the hermes venv's site-packages (this loads the hook at interpreter startup; see "How it works" below for why a `.pth` and not `sitecustomize.py`)
 - Restarts `hermes-gateway.service` if running
 
@@ -54,7 +54,7 @@ The `.pth` shim runs *before* `site.py` imports `sitecustomize`, on every platfo
 ## What gets modified
 | File | Action |
 |------|--------|
-| `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
+| `$HERMES_HOME/patches/anthropic_billing_bypass.py` | Created |
 | `<venv>/lib/pythonX.Y/site-packages/hermes_claude_auth.pth` | Created |
 | `<venv>/lib/pythonX.Y/site-packages/_hermes_claude_auth_bootstrap.py` | Created |
 | `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Removed if left behind by a legacy install (original restored from `.pre-hermes-claude-auth` backup when present) |
@@ -68,7 +68,7 @@ The `.pth` shim runs *before* `site.py` imports `sitecustomize`, on every platfo
 ## Troubleshooting
 
 ### Install issues
-- **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/`
+- **"hermes-agent not found"**: Make sure Hermes is installed at `$HERMES_HOME/hermes-agent/` (defaults to `~/.hermes/hermes-agent/`)
 - **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
 - **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
 - **Bypass silently inactive on Debian/Ubuntu** (legacy `sitecustomize.py` installs only): If you installed before the `.pth` migration, the bypass may never have actually run on your host. Debian/Ubuntu ship `/usr/lib/pythonX.Y/sitecustomize.py` for apport, and that one wins import priority over the venv-local `sitecustomize.py`, so the hook never installs. Quick diagnostic:
@@ -93,7 +93,7 @@ The `.pth` shim runs *before* `site.py` imports `sitecustomize`, on every platfo
      ```bash
      ./install.sh
      ```
-  3. Remove stale `ANTHROPIC_TOKEN` / `ANTHROPIC_API_KEY` values from `~/.hermes/.env` — they can override subscription auth.
+  3. Remove stale `ANTHROPIC_TOKEN` / `ANTHROPIC_API_KEY` values from `$HERMES_HOME/.env` — they can override subscription auth.
   4. Reset cached credentials:
      ```bash
      hermes auth reset anthropic
