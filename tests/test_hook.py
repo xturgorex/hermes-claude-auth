@@ -20,7 +20,7 @@ def _clear_bypass_finders():
 @pytest.fixture
 def hook_module(monkeypatch):
     _clear_bypass_finders()
-    module = importlib.import_module("sitecustomize_hook")
+    module = importlib.import_module("_hermes_claude_auth_bootstrap")
     module = importlib.reload(module)
     _clear_bypass_finders()
     yield module
