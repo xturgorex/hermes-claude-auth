@@ -17,6 +17,18 @@ Version history
   X-Claude-Code-Session-Id header, context_management body field,
   effort-2025-11-24 + context-management-2025-06-27 betas, Node v24.3.0
   stainless header, cache_control on system identity entry.
+- 1.6.0 (2026-08-06): Bound the headerless-429 auto-wait loop.  A 429 whose
+  body is ``{"type":"rate_limit_error","message":"Error"}`` and which carries
+  no ``anthropic-ratelimit-unified-*`` headers is Anthropic's third-party
+  *detection* response, not a quota — the request went out without the Claude
+  Code identity.  Retrying it unchanged can never succeed, but the previous
+  code fell back to ``HERMES_RL_AUTOWAIT_DEFAULT_S`` (300s) and looped
+  forever.  Observed in production: one stuck ``delegate_task`` child emitted
+  370 × 429 over 24h at exactly 5-minute spacing while its parent stayed
+  blocked on ``result()``.  Headerless 429s now retry at most
+  ``HERMES_RL_AUTOWAIT_HEADERLESS_ATTEMPTS`` (default 2) times before
+  re-raising to Hermes core's normal give-up path.  429s that *do* carry
+  reset headers (real quota) are unaffected.
 - 1.5.7 (2026-05-30): Root cause fix: preserve original Anthropic content
   block interleaving order instead of stripping thinking blocks as a
   workaround.  Hermes core changes:
@@ -1342,6 +1354,9 @@ def _install_response_pascalcase_unhook(
 #   HERMES_RL_AUTOWAIT_MAX_7D_S      int      7d-window safety cap     (default 648000 = 7.5d)
 #   HERMES_RL_AUTOWAIT_BUFFER_S      int      pad after reset          (default 5)
 #   HERMES_RL_AUTOWAIT_DEFAULT_S     int      wait when no reset found (default 300)
+#   HERMES_RL_AUTOWAIT_HEADERLESS_ATTEMPTS
+#                                    int      retries for a 429 that   (default 2)
+#                                             carries no reset header
 #
 # The wait loop also calls ``agent._touch_activity(...)`` every ~25s so the
 # gateway's inactivity watchdog (default 1800s = 30 min) doesn't kill the
@@ -1630,9 +1645,9 @@ _RL_WINDOW_DEFAULTS_S: dict = {
     "7d": int(7.5 * 86400),  # 648000
 }
 _RL_WINDOW_LABEL: dict = {
-    "5h": "de 5h (Pro/Max)",
-    "1d": "diária (1d)",
-    "7d": "semanal (7d)",
+    "5h": "5h (Pro/Max)",
+    "1d": "daily (1d)",
+    "7d": "weekly (7d)",
 }
 
 
@@ -1660,8 +1675,35 @@ def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
 
     window, reset = _rl_seconds_until_reset(exc)
     if reset is None:
-        # No parseable reset header.  Use a conservative default so we still
-        # recover from subscription-window 429s that omit the header.
+        # No parseable reset header.  Two very different situations produce
+        # this, and they need opposite handling:
+        #
+        #   (a) a genuine subscription-window 429 whose reset header we
+        #       simply failed to parse — waiting the default and retrying
+        #       is correct and eventually succeeds;
+        #   (b) a *third-party detection* 429 (body ``{"type":"rate_limit_
+        #       error","message":"Error"}``, no ``anthropic-ratelimit-
+        #       unified-*`` headers at all).  This is not a quota at all —
+        #       it means the request went out without the Claude Code
+        #       identity (e.g. ``is_oauth=False``, a poisoned credential
+        #       lease).  Retrying the *identical* call can never clear it.
+        #
+        # We cannot distinguish (a) from (b) at the header level, so we
+        # bound the headerless case instead of looping forever.  Left
+        # unbounded, case (b) turns a single broken credential into a
+        # permanent 429-every-DEFAULT_S heartbeat against the API: observed
+        # in the wild as one stuck delegate_task child emitting 370 × 429
+        # over 24h at exactly 5-minute spacing, with the parent blocked on
+        # its result() the entire time.
+        headerless_cap = _rl_env_int("HERMES_RL_AUTOWAIT_HEADERLESS_ATTEMPTS", 2)
+        if attempt > headerless_cap:
+            _rl_emit(
+                agent,
+                f"⏹ 429 with no reset headers after {attempt} attempts — this is "
+                f"not a quota limit (looks like a request rejected for missing "
+                f"Claude Code identity). Giving up on auto-wait.",
+            )
+            return False
         reset = float(default_s)
         had_header = False
     else:
@@ -1673,26 +1715,26 @@ def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
         return True  # already reset — retry immediately
 
     if reset + buffer_s > max_wait:
-        label = _RL_WINDOW_LABEL.get(window or "", "de uso") if window else "de uso"
+        label = _RL_WINDOW_LABEL.get(window or "", "usage") if window else "usage"
         _rl_emit(
             agent,
-            f"⏱️ Quota Claude (janela {label}) esgotada, mas o reset é só "
-            f"daqui a {_rl_fmt_eta(reset)} — acima do safety-cap "
-            f"({_rl_fmt_eta(max_wait)}). A parar.",
+            f"⏱️ Claude {label} quota exhausted, but it does not reset for "
+            f"{_rl_fmt_eta(reset)} — beyond the safety cap "
+            f"({_rl_fmt_eta(max_wait)}). Stopping.",
         )
         return False
 
     eta = _rl_fmt_eta(wait_s)
     clock = _rl_local_clock(wait_s)
-    src = "" if had_header else " (estimativa)"
+    src = "" if had_header else " (estimated)"
     if window and window in _RL_WINDOW_LABEL:
         window_msg = f" ({_RL_WINDOW_LABEL[window]})"
     else:
         window_msg = ""
     _rl_emit(
         agent,
-        f"⏸ Quota Claude{window_msg} esgotada. A aguardar o reset da janela "
-        f"≈{eta}{src} (retomo por volta das {clock}). A dormir…",
+        f"⏸ Claude quota{window_msg} exhausted. Waiting ≈{eta}{src} for the "
+        f"window to reset (resuming around {clock}). Sleeping…",
     )
 
     # Touch activity once before sleeping so the gateway sees the wait
@@ -1712,7 +1754,7 @@ def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
         if remaining <= 0:
             break
         if _rl_interrupted(agent):
-            _rl_emit(agent, "⏹ Interrompido durante a espera pela quota — a parar.")
+            _rl_emit(agent, "⏹ Interrupted while waiting for quota reset — stopping.")
             return False
         time.sleep(min(5.0, remaining))
         # Refresh liveness periodically.  Cheap and best-effort.
@@ -1725,7 +1767,7 @@ def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
                 f"(≈{remaining_str} left)",
             )
 
-    _rl_emit(agent, "▶ Quota reposta — a retomar a execução.")
+    _rl_emit(agent, "▶ Quota reset — resuming execution.")
     return True
 
 
