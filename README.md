@@ -8,12 +8,15 @@ Patches hermes-agent at runtime to pass Anthropic's server-side OAuth content va
 On 2026-04-04, Anthropic added server-side validation that rejects OAuth requests from third-party tools. This patch adds the billing header signature and system prompt structure the API expects.
 
 ## Prerequisites
-- hermes-agent installed (`$HERMES_HOME/hermes-agent/`, defaults to `~/.hermes/hermes-agent/`)
+- hermes-agent installed (`$HERMES_HOME/hermes-agent/`, defaults to `~/.hermes/hermes-agent/` on Linux/macOS and `%LOCALAPPDATA%\hermes\hermes-agent\` on Windows)
 - Claude Code CLI authenticated (valid credentials at `~/.claude/.credentials.json`)
 - hermes-agent configured for OAuth (`credential_pool` has a `claude_code` entry in `$HERMES_HOME/auth.json`)
 - Python 3.11+
+- **Windows**: PowerShell 5.1+ and Git in PATH
 
 ## Install
+
+### Linux / macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
 ```
@@ -25,15 +28,37 @@ cd hermes-claude-auth
 ./install.sh
 ```
 
-What `install.sh` does:
-- Copies `anthropic_billing_bypass.py` to `$HERMES_HOME/patches/` (defaults to `~/.hermes/patches/`)
+### Windows (PowerShell)
+```powershell
+irm https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.ps1 | iex
+```
+
+Or clone manually:
+```powershell
+git clone https://github.com/kristianvast/hermes-claude-auth.git
+cd hermes-claude-auth
+.\install.ps1
+```
+
+What the installer does:
+- Auto-detects your hermes directory (`$HERMES_HOME` if set, else `%LOCALAPPDATA%\hermes\` on Windows and `~/.hermes/` on Linux/macOS)
+- Copies `anthropic_billing_bypass.py` to `<hermes-dir>/patches/`
 - Installs a `.pth` shim + bootstrap module into the hermes venv's site-packages (this loads the hook at interpreter startup; see "How it works" below for why a `.pth` and not `sitecustomize.py`)
-- Restarts `hermes-gateway.service` if running
+- Mirrors Claude Code credentials from the OS credential store to `~/.claude/.credentials.json` (macOS Keychain / Windows Credential Manager)
+- Restarts `hermes-gateway.service` if running (Linux only)
 
 ## Uninstall
+
+### Linux / macOS
 ```bash
 ./uninstall.sh          # remove hook only
 ./uninstall.sh --purge  # remove hook + patch file
+```
+
+### Windows (PowerShell)
+```powershell
+.\uninstall.ps1          # remove hook only
+.\uninstall.ps1 -Purge   # remove hook + patch file
 ```
 
 ## Surviving `hermes update` (auto-recovery)
@@ -84,8 +109,7 @@ lives at `$LOCALAPPDATA/hermes/patches/sitecustomize.py` (outside any repo).
 > with Git for Windows). The cron script uses `uname` to resolve paths and
 > works under the Hermes gateway's environment.
 
-
-
+## How it works
 1. **Billing header**: SHA-256 signed `x-anthropic-billing-header` injected as `system[0]`
 2. **System prompt relocation**: Non-identity system entries moved to the first user message as `<system-reminder>` blocks
 3. **Beta flags**: Adds `prompt-caching-scope-2026-01-05` and `advisor-tool-2026-03-01`
@@ -149,8 +173,8 @@ upstream issue #6.
 | File | Action |
 |------|--------|
 | `$HERMES_HOME/patches/anthropic_billing_bypass.py` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/hermes_claude_auth.pth` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/_hermes_claude_auth_bootstrap.py` | Created |
+| `<venv>/lib/pythonX.Y/site-packages/hermes_claude_auth.pth` (Linux/macOS)<br>`<venv>\Lib\site-packages\hermes_claude_auth.pth` (Windows) | Created |
+| `<venv>/lib/pythonX.Y/site-packages/_hermes_claude_auth_bootstrap.py` (Linux/macOS)<br>`<venv>\Lib\site-packages\_hermes_claude_auth_bootstrap.py` (Windows) | Created |
 | `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Removed if left behind by a legacy install (original restored from `.pre-hermes-claude-auth` backup when present) |
 | hermes-agent source files | NOT modified |
 
@@ -225,6 +249,7 @@ This fork intentionally does **not** include some open upstream PRs. Status:
   ```
 
   `ModuleNotFoundError` means the hook isn't running. Fix is to re-run `./install.sh` — the current installer uses a `.pth` shim that sidesteps the apport collision and auto-migrates legacy installs.
+- **PowerShell execution policy**: The remote installer (`irm | iex`) handles this automatically. For manual runs, use `powershell -ExecutionPolicy Bypass -File .\install.ps1`
 
 ### Auth issues
 
@@ -270,6 +295,23 @@ This fork intentionally does **not** include some open upstream PRs. Status:
   ```
 
   Credit: the macOS Keychain mirror approach was written up by [@DrQbz](https://github.com/DrQbz) in [issue #5](https://github.com/kristianvast/hermes-claude-auth/issues/5) and is now automated in `install.sh`.
+
+  **On Windows**, `install.ps1` auto-mirrors the `Claude Code-credentials` entry from Windows Credential Manager into `~/.claude/.credentials.json` using the Win32 Credential API (analogous to the macOS Keychain mirror). Re-running the installer is usually sufficient:
+  ```powershell
+  .\install.ps1
+  ```
+  If auto-mirroring fails (e.g. PowerShell constrained language mode), re-authenticate and retry:
+  ```powershell
+  claude auth login --claudeai
+  .\install.ps1
+  ```
+  If credentials still aren't found, check Windows Credential Manager manually:
+  ```powershell
+  # List all Claude-related credentials
+  cmdkey /list:*Claude*
+  # If no entry exists, re-authenticate:
+  claude auth login --claudeai
+  ```
 
 ### Billing / routing issues
 
