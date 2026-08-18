@@ -48,7 +48,7 @@ import platform
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger("anthropic_billing_bypass")
 
