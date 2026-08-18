@@ -4,9 +4,9 @@ import copy
 from types import SimpleNamespace
 
 from anthropic_billing_bypass import (
+    _AGENT_SDK_SYSTEM_IDENTITY,
     _BILLING_ENTRYPOINT,
     _MCP_HERMES_NAMESPACE,
-    _OLD_SYSTEM_IDENTITY,
     _SESSION_ID,
     _SYSTEM_IDENTITY,
     _fix_temperature_for_oauth_adaptive,
@@ -759,31 +759,48 @@ def test_response_unhook_is_idempotent():
 # ---------------------------------------------------------------------------
 
 
-def test_system_identity_is_new_agent_sdk_prefix():
-    """Verify _SYSTEM_IDENTITY uses the CC 2.1.117 identity string."""
-    assert _SYSTEM_IDENTITY == "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-    assert _OLD_SYSTEM_IDENTITY == "You are Claude Code, Anthropic's official CLI for Claude."
+def test_system_identity_tracks_upstream_claude_code_prefix():
+    """The emitted identity must match upstream opencode-claude-auth.
+
+    Upstream still ships this exact string at ccVersion 2.1.217, so PR #15's
+    "Claude Agent SDK" identity is not what the validator expects. That variant
+    is only recognised on input.
+    """
+    assert _SYSTEM_IDENTITY == "You are Claude Code, Anthropic's official CLI for Claude."
+    assert _AGENT_SDK_SYSTEM_IDENTITY == (
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    )
 
 
-def test_bypass_replaces_old_identity_with_new(basic_api_kwargs):
-    """When hermes-agent sends the old identity, bypass should replace it."""
-    assert basic_api_kwargs["system"][0]["text"].startswith(_OLD_SYSTEM_IDENTITY)
+def test_bypass_normalizes_agent_sdk_identity_to_claude_code(new_identity_api_kwargs):
+    """An Agent-SDK identity on input is rewritten to the canonical one."""
+    assert new_identity_api_kwargs["system"][0]["text"].startswith(
+        _AGENT_SDK_SYSTEM_IDENTITY
+    )
 
-    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+    apply_claude_code_bypass(new_identity_api_kwargs, "2.1.217")
 
-    system = basic_api_kwargs["system"]
-    identity_entry = system[1]
+    identity_entry = new_identity_api_kwargs["system"][1]
     assert identity_entry["text"] == _SYSTEM_IDENTITY
     assert identity_entry.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
 
 
-def test_bypass_preserves_new_identity(new_identity_api_kwargs):
-    """When system already has the new identity, bypass should keep it."""
-    apply_claude_code_bypass(new_identity_api_kwargs, "2.1.117")
+def test_bypass_emits_exactly_one_identity_entry(new_identity_api_kwargs):
+    """Normalising must not leave both identity variants in system[]."""
+    apply_claude_code_bypass(new_identity_api_kwargs, "2.1.217")
 
     system = new_identity_api_kwargs["system"]
-    identity_entry = system[1]
-    assert identity_entry["text"] == _SYSTEM_IDENTITY
+    identities = [
+        e for e in system
+        if isinstance(e, dict)
+        and isinstance(e.get("text"), str)
+        and (
+            e["text"].startswith(_SYSTEM_IDENTITY)
+            or e["text"].startswith(_AGENT_SDK_SYSTEM_IDENTITY)
+        )
+    ]
+    assert len(identities) == 1
+    assert identities[0]["text"] == _SYSTEM_IDENTITY
 
 
 def test_bypass_injects_cache_control_on_identity(basic_api_kwargs):

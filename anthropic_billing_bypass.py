@@ -11,12 +11,21 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
-- 1.6.0 (2026-05-08): Update wire format for CC 2.1.117 parity — new system
-  identity prefix ("Claude agent" replacing "Claude Code"), structured
+- 1.7.0 (2026-08-18): Community PR integration sweep.  Fingerprint re-synced
+  to upstream's current ``ccVersion`` 2.1.217 (was pinned at 2.1.112 while
+  the real CLI shipped 2.1.234): system identity reverted to upstream's
+  "You are Claude Code, ..." string (the "Claude Agent SDK" variant from
+  PR #15 is now only *recognised* on input, never emitted), beta list aligned
+  to upstream ``baseBetas`` (added interleaved-thinking-2025-05-14,
+  thinking-token-count-2026-05-13, extended-cache-ttl-2025-04-11; dropped the
+  unconditional effort-2025-11-24, which upstream applies per-model), and the
+  per-request ``x-client-request-id`` header added.  Merges PR #16/#20/#21/
+  #23/#24/#26/#27/#28.
+- 1.6.0 (2026-05-08): Wire-format changes for CC 2.1.117 parity — structured
   metadata (JSON-encoded device_id + account_uuid + session_id),
-  X-Claude-Code-Session-Id header, context_management body field,
-  effort-2025-11-24 + context-management-2025-06-27 betas, Node v24.3.0
-  stainless header, cache_control on system identity entry.
+  X-Claude-Code-Session-Id header, context_management body field, Node v24.3.0
+  stainless header, cache_control on system identity entry.  (Its system
+  identity change was reverted in 1.7.0; see above.)
 - 1.6.0 (2026-08-06): Bound the headerless-429 auto-wait loop.  A 429 whose
   body is ``{"type":"rate_limit_error","message":"Error"}`` and which carries
   no ``anthropic-ratelimit-unified-*`` headers is Anthropic's third-party
@@ -103,7 +112,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import hashlib
 import inspect
@@ -135,12 +144,18 @@ _BILLING_ENTRYPOINT = "sdk-cli"
 # Sentinel strings — entries in system[] starting with these are kept;
 # everything else is relocated to the first user message.
 _BILLING_PREFIX = "x-anthropic-billing-header"
-# CC 2.1.117 changed the identity prefix from the old "You are Claude Code..."
-# to this new Agent SDK identity.  The server-side validator matches on the
-# identity prefix to route requests to subscription billing vs extra-usage.
-_SYSTEM_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-# Keep the old prefix for matching — hermes-agent may still inject it.
-_OLD_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+# The identity prefix the validator matches to route a request to subscription
+# billing.  Upstream griffinmartin/opencode-claude-auth still ships this exact
+# string at ccVersion 2.1.217 (src/transforms.ts), i.e. far newer than the
+# 2.1.117 that PR #15 claimed had replaced it with an "Agent SDK" identity.
+# Deviating here is what flips traffic to extra-usage, so track upstream.
+_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+# Also recognised on input so an Agent-SDK-style identity injected by
+# hermes-agent (or left by an older install) is normalised, not duplicated.
+_AGENT_SDK_SYSTEM_IDENTITY = (
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+)
+_OLD_SYSTEM_IDENTITY = _AGENT_SDK_SYSTEM_IDENTITY
 
 # Hermes prefixes MCP tools with ``mcp_``.  We rewrite that to the standard
 # ``mcp__<server>__<tool>`` namespace Anthropic expects from real Claude Code,
@@ -158,9 +173,10 @@ _STAINLESS_NODE_VERSION = "v24.3.0"
 # user-agent header when dynamic detection fails (e.g. Claude CLI not on
 # PATH).  Anthropic's validator cross-references these; a mismatch flags the
 # request as third-party and routes traffic to extra usage.
-# Ported from kristianvast/hermes-claude-auth PR #21, which mirrors
-# griffinmartin/opencode-claude-auth PR #207 (``ccVersion: "2.1.112"``).
-_PINNED_CC_VERSION = "2.1.112"
+# Tracks upstream griffinmartin/opencode-claude-auth ``ccVersion`` (currently
+# "2.1.217", src/model-config.ts).  When Claude Code IS on PATH the detected
+# version wins, so this only matters on hosts without the CLI installed.
+_PINNED_CC_VERSION = "2.1.217"
 
 # Cache for the dynamically detected Claude Code version.
 _CC_VERSION_CACHE: Optional[str] = None
@@ -200,12 +216,22 @@ def _local_claude_version() -> str:
     return _detect_local_claude_version()
 
 # OAuth-only beta flags appended on top of hermes-agent's built-in
-# ``claude-code-20250219`` and ``oauth-2025-04-20``.
+# ``claude-code-20250219`` and ``oauth-2025-04-20``.  Mirrors the remainder of
+# upstream's ``baseBetas`` (src/model-config.ts @ ccVersion 2.1.217).
+#
+# ``effort-2025-11-24`` is deliberately absent: upstream moved it out of
+# baseBetas into per-model overrides (added for 4-6/4-7, excluded for
+# sonnet/haiku).  Hermes installs these flags process-wide rather than
+# per-request, so sending it unconditionally would hit the models upstream
+# explicitly excludes.  ``_strip_effort`` still removes the ``effort``
+# *parameter* for haiku, which is a separate concern.
 _EXTRA_OAUTH_BETAS = [
+    "interleaved-thinking-2025-05-14",
     "prompt-caching-scope-2026-01-05",
     "context-management-2025-06-27",
     "advisor-tool-2026-03-01",
-    "effort-2025-11-24",
+    "thinking-token-count-2026-05-13",
+    "extended-cache-ttl-2025-04-11",
 ]
 
 # Stable per-process session ID matching CC's X-Claude-Code-Session-Id.
@@ -588,7 +614,7 @@ def _stainless_os() -> str:
 
 
 def _build_spoof_headers() -> Dict[str, str]:
-    """Headers real Claude Code 2.1.117 sends that hermes-agent does not.
+    """Headers real Claude Code sends that hermes-agent does not.
 
     The Anthropic SDK (Stainless-generated) automatically attaches
     ``x-stainless-*`` identifying headers.  The validator cross-references
@@ -599,6 +625,8 @@ def _build_spoof_headers() -> Dict[str, str]:
     return {
         "anthropic-dangerous-direct-browser-access": "true",
         "x-claude-code-session-id": _SESSION_ID,
+        # Fresh per request, matching upstream's crypto.randomUUID() call.
+        "x-client-request-id": str(uuid.uuid4()),
         "x-stainless-arch": _stainless_arch(),
         "x-stainless-lang": "js",
         "x-stainless-os": _stainless_os(),
