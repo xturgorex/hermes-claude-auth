@@ -37,7 +37,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.5.1+rl-autodetect"
 
 import hashlib
 import inspect
@@ -46,6 +46,7 @@ import logging
 import os
 import platform
 import sys
+import time
 import traceback
 from typing import Any, Dict, List, Set
 
@@ -80,6 +81,51 @@ _MCP_HERMES_NAMESPACE = "mcp__hermes__"
 # upstream's spoof uses lowercase, and so does our pre-merge code).
 _STAINLESS_PACKAGE_VERSION = "0.81.0"
 _STAINLESS_NODE_VERSION = "v22.11.0"
+
+# Fallback CC version used for BOTH the billing-header signature AND the
+# user-agent header when dynamic detection fails (e.g. Claude CLI not on
+# PATH).  Anthropic's validator cross-references these; a mismatch flags the
+# request as third-party and routes traffic to extra usage.
+# Ported from kristianvast/hermes-claude-auth PR #21, which mirrors
+# griffinmartin/opencode-claude-auth PR #207 (``ccVersion: "2.1.112"``).
+_PINNED_CC_VERSION = "2.1.112"
+
+# Cache for the dynamically detected Claude Code version.
+_CC_VERSION_CACHE: Optional[str] = None
+
+
+def _detect_local_claude_version() -> str:
+    """Detect the installed Claude Code version from the local binary.
+
+    Runs ``claude --version`` (and ``claude-code --version`` as a fallback)
+    and parses the leading ``X.Y.Z`` token.  Returns the fallback pin if the
+    binary is missing or the output is unparseable.  Cached after first call.
+    """
+    global _CC_VERSION_CACHE
+    if _CC_VERSION_CACHE is not None:
+        return _CC_VERSION_CACHE
+    import subprocess as _sp
+    for cmd in ("claude", "claude-code"):
+        try:
+            result = _sp.run(
+                [cmd, "--version"],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                version = result.stdout.strip().split()[0]
+                if version and version[0].isdigit():
+                    _CC_VERSION_CACHE = version
+                    return version
+        except Exception:
+            pass
+    _CC_VERSION_CACHE = _PINNED_CC_VERSION
+    return _CC_VERSION_CACHE
+
+
+def _local_claude_version() -> str:
+    """Public accessor: the version to advertise in headers + billing signature."""
+    return _detect_local_claude_version()
 
 # OAuth-only beta flags appended on top of hermes-agent's built-in
 # ``claude-code-20250219`` and ``oauth-2025-04-20``.
@@ -295,12 +341,28 @@ def _build_spoof_headers() -> Dict[str, str]:
 
 def _merge_spoof_extras(api_kwargs: Dict[str, Any]) -> None:
     """Existing extra_headers/extra_query take precedence so hermes's own
-    headers (e.g. fast-mode beta) survive — additive spoof only."""
+    headers (e.g. fast-mode beta) survive — additive spoof only.
+
+    Exception: ``user-agent`` is forcibly overridden to match the billing
+    header's ``cc_entrypoint=sdk-cli``.  Hermes-agent's adapter sets
+    ``claude-cli/{detected-version} (external, cli)`` at client-construction
+    time, but the billing header (built later in this module) claims
+    ``cc_entrypoint=sdk-cli``.  Anthropic's validator catches the mismatch
+    and routes the request to third-party billing (``HTTP 400 You're out of
+    extra usage``).  Ported from hermes-claude-auth PR #21 / upstream #207.
+    """
     merged_headers: Dict[str, str] = dict(_build_spoof_headers())
     existing_headers = api_kwargs.get("extra_headers")
     if isinstance(existing_headers, dict):
         for k, v in existing_headers.items():
             merged_headers[k] = v
+    # Force user-agent to (external, sdk-cli) regardless of what hermes set
+    # on the SDK client; the existing_headers loop above would otherwise let
+    # hermes's "(external, cli)" win and break fingerprint parity.
+    merged_headers["user-agent"] = (
+        f"claude-cli/{_local_claude_version()} (external, sdk-cli)"
+    )
+    merged_headers["x-app"] = "cli"
     api_kwargs["extra_headers"] = merged_headers
 
     merged_query: Dict[str, Any] = {"beta": "true"}
@@ -600,6 +662,29 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
 
 
 def _get_version_safely(aa_module: Any) -> str:
+    """Return the Claude Code version used to sign the billing header.
+
+    Detects the *installed* Claude Code version dynamically (via
+    ``claude --version``) so the billing header's ``cc_version=`` and the
+    user-agent's ``claude-cli/<version>`` always match the local binary —
+    never drifting behind it.  This is what keeps Anthropic's third-party
+    validator happy and routes to the subscription bucket instead of extra
+    usage.
+
+    Falls back to ``_PINNED_CC_VERSION`` if detection fails (e.g. Claude Code
+    not on PATH), so the patch never hard-fails.
+
+    Ported from hermes-claude-auth PR #21 / upstream #207, with dynamic
+    detection replacing the static pin.
+    """
+    detected = _local_claude_version()
+    if detected and detected[0].isdigit():
+        return detected
+    return _PINNED_CC_VERSION
+
+
+def _get_version_detected(aa_module: Any) -> str:
+    """Original dynamic detection, kept for diagnostics/tests."""
     getter = getattr(aa_module, "_get_claude_code_version", None)
     if callable(getter):
         try:
@@ -750,6 +835,496 @@ def _install_response_pascalcase_unhook(
     return any_installed
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Subscription rate-limit auto-wait (Claude Pro/Max windows: 5h, 1d, 7d)
+# =========================================================================
+# When a long agent run exhausts a Claude Pro/Max usage window mid-flight,
+# api.anthropic.com returns HTTP 429 (rate_limit_error) with a reset time in
+# the ``retry-after`` and/or ``anthropic-ratelimit-unified-*-reset`` headers.
+# Hermes core's retry loop caps backoff at 120s and gives up after
+# ``_api_max_retries``, surfacing "rate-limiting requests" on Telegram and
+# abandoning the run.
+#
+# This patch wraps the two API-call entry points on ``run_agent.AIAgent``
+# (``_interruptible_api_call`` and ``_interruptible_streaming_api_call``) so a
+# genuine subscription-window 429 instead SLEEPS until the window resets
+# (interruptibly, in short chunks) and then retries the same call
+# transparently — the give-up logic never runs.  Per-minute throttles (short
+# resets) are slept through too.
+#
+# As of v1.5.9 the auto-wait is **window-aware**: Anthropic now reports which
+# subscription window tripped via the unified
+# ``anthropic-ratelimit-unified-{5h,1d,7d}-status`` / ``-reset`` headers.
+# We pick the **longest** waiting window (e.g. a 7d hit also covers the 5h
+# window, so a single sleep clears both) and apply a **per-window** safety
+# cap — the legacy 6h cap is no longer the bottleneck when the weekly
+# window trips.  Behaviour is tunable via env vars:
+#
+#   HERMES_RL_AUTOWAIT               "1"/"0"  enable/disable           (default 1)
+#   HERMES_RL_AUTOWAIT_MAX_S         int      fallback cap seconds     (default 21600 = 6h)
+#                                                (used when no window could be detected)
+#   HERMES_RL_AUTOWAIT_MAX_5H_S      int      5h-window safety cap     (default 21600 = 6h)
+#   HERMES_RL_AUTOWAIT_MAX_1D_S      int      1d-window safety cap     (default 93600 = 26h)
+#   HERMES_RL_AUTOWAIT_MAX_7D_S      int      7d-window safety cap     (default 648000 = 7.5d)
+#   HERMES_RL_AUTOWAIT_BUFFER_S      int      pad after reset          (default 5)
+#   HERMES_RL_AUTOWAIT_DEFAULT_S     int      wait when no reset found (default 300)
+#
+# The wait loop also calls ``agent._touch_activity(...)`` every ~25s so the
+# gateway's inactivity watchdog (default 1800s = 30 min) doesn't kill the
+# agent mid-wait.  Without this tick the auto-wait would always lose to the
+# watchdog at ~30 min, defeating the whole feature.
+#
+# Idempotent.  Never breaks the call path: if anything goes wrong parsing or
+# patching, the original method/exception behaviour is preserved.
+
+_RL_AUTOWAIT_PATCHED_FLAG = "_CLAUDE_CODE_RL_AUTOWAIT_PATCHED"
+
+
+def _rl_env_int(name: str, default: int) -> int:
+    try:
+        v = int(str(os.environ.get(name, "")).strip())
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _rl_autowait_enabled() -> bool:
+    return str(os.environ.get("HERMES_RL_AUTOWAIT", "1")).strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _rl_is_rate_limit_error(exc: Exception) -> bool:
+    """True only for a real HTTP 429 from the provider."""
+    if exc is None:
+        return False
+    if type(exc).__name__ == "RateLimitError":
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    return status == 429
+
+
+def _rl_parse_headers(exc: Exception) -> Dict[str, str]:
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return {}
+    try:
+        return {str(k).lower(): str(v) for k, v in dict(headers).items()}
+    except Exception:
+        try:
+            return {str(k).lower(): str(headers[k]) for k in headers}  # type: ignore[index]
+        except Exception:
+            return {}
+
+
+# Anthropic rate-limit windows we recognise.  The numeric suffix (``5h``,
+# ``1d``, ``7d``) matches the suffix Anthropic uses in the
+# ``anthropic-ratelimit-unified-*-status`` / ``-reset`` / ``-utilization``
+# headers.  ``5h`` is the Pro/Max subscription window; ``7d`` is the weekly
+# cap; ``1d`` appears on some enterprise tiers.
+_RL_KNOWN_WINDOWS: tuple = ("7d", "1d", "5h")
+
+
+def _rl_parse_timestamp(raw: str, now: float) -> "float | None":
+    """Parse a ``anthropic-ratelimit-*-reset`` value into seconds-until-reset.
+
+    Accepts:
+      * absolute epoch seconds (Anthropic's typical form),
+      * a small relative duration in seconds,
+      * RFC 3339 / ISO 8601 timestamps.
+
+    Returns ``None`` if the value can't be parsed.  ``now`` is the reference
+    time in ``time.time()`` seconds — passed in so all callers in a single
+    429-handling path agree on "now" (avoids drift across separate calls).
+    """
+    import datetime as _dt
+    import email.utils as _eut
+
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    # epoch seconds (Anthropic unified-reset is usually a Unix timestamp)
+    try:
+        ts = float(raw)
+        # If it looks like an absolute epoch (in the future), use delta;
+        # if it's a small number, treat as a relative duration.
+        if ts > 1_000_000_000:  # ~2001+, clearly absolute epoch seconds
+            return max(0.0, ts - now)
+        return max(0.0, ts)
+    except ValueError:
+        pass
+    # RFC 3339 / ISO 8601
+    try:
+        iso = raw.replace("Z", "+00:00")
+        dt = _dt.datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return max(0.0, dt.timestamp() - now)
+    except Exception:
+        return None
+    # retry-after / HTTP-date as a last resort
+    try:
+        parsed = _eut.parsedate_to_datetime(raw)
+        if parsed is not None:
+            return max(0.0, parsed.timestamp() - now)
+    except Exception:
+        return None
+    return None
+
+
+def _rl_status_for(window: str) -> str:
+    return f"anthropic-ratelimit-unified-{window}-status"
+
+
+def _rl_reset_for(window: str) -> str:
+    return f"anthropic-ratelimit-unified-{window}-reset"
+
+
+def _rl_detect_throttled_window(headers: Dict[str, str], now: float) -> "tuple":
+    """Identify the throttled subscription window and its reset delta.
+
+    Returns ``(window_name, seconds_until_reset)`` where either field may be
+    ``None``.  When several windows are throttled at once (e.g. 5h and 7d
+    both at the cap on a heavy Pro run), we pick the **longest** wait so a
+    single sleep clears everything — waiting through a 7d reset also clears
+    the 5h window.
+    """
+    if not headers:
+        return None, None
+    best_window = None
+    best_secs: "float | None" = None
+    for window in _RL_KNOWN_WINDOWS:
+        status = headers.get(_rl_status_for(window))
+        if not status or status.strip().lower() != "throttled":
+            continue
+        raw = headers.get(_rl_reset_for(window))
+        if not raw:
+            continue
+        secs = _rl_parse_timestamp(raw, now)
+        if secs is None:
+            continue
+        if best_secs is None or secs > best_secs:
+            best_window, best_secs = window, secs
+    return best_window, best_secs
+
+
+def _rl_seconds_until_reset(exc: Exception) -> "tuple":
+    """Parse a 429's reset info into ``(window_name, seconds_until_reset)``.
+
+    Detection order:
+      1. ``anthropic-ratelimit-unified-{7d,1d,5h}-status=throttled`` plus the
+         matching ``-reset`` header (window-aware — preferred when present).
+      2. ``retry-after`` (RFC 7231: delta-seconds or HTTP-date) — windowless.
+      3. ``anthropic-ratelimit-unified-reset`` (epoch seconds or RFC 3339).
+      4. Any other ``anthropic-ratelimit-*-reset`` (we keep the longest).
+
+    ``window_name`` is one of ``"7d"``, ``"1d"``, ``"5h"``, or ``None`` when
+    we can't tell which window tripped (e.g. only ``retry-after`` was set).
+    The returned ``seconds_until_reset`` is the value to sleep, *already
+    bounded to be non-negative* — callers still need to apply the per-window
+    safety cap.
+    """
+    import email.utils as _eut
+
+    headers = _rl_parse_headers(exc)
+    if not headers:
+        return None, None
+    now = time.time()
+
+    # 1. window-aware: if Anthropic told us which window throttled us,
+    #    trust the matching reset header.
+    window, secs = _rl_detect_throttled_window(headers, now)
+    if window is not None and secs is not None:
+        return window, secs
+
+    # 2. retry-after (windowless — works for any provider that sets it)
+    ra = headers.get("retry-after")
+    if ra:
+        ra = ra.strip()
+        try:
+            return None, max(0.0, float(ra))  # delta-seconds
+        except ValueError:
+            try:  # HTTP-date
+                parsed = _eut.parsedate_to_datetime(ra)
+                if parsed is not None:
+                    return None, max(0.0, parsed.timestamp() - now)
+            except Exception:
+                pass
+
+    # 3 + 4. anthropic-ratelimit-*-reset (unified first, then any other)
+    unified = headers.get("anthropic-ratelimit-unified-reset")
+    if unified:
+        secs = _rl_parse_timestamp(unified, now)
+        if secs is not None:
+            return None, secs
+    candidates = [
+        v for k, v in headers.items()
+        if k.startswith("anthropic-ratelimit-") and k.endswith("-reset")
+    ]
+    best = None
+    for raw in candidates:
+        secs = _rl_parse_timestamp(raw, now)
+        if secs is not None:
+            best = secs if best is None else max(best, secs)
+    return None, best
+
+
+def _rl_fmt_eta(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{m}m {sec}s" if sec else f"{m}m"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def _rl_local_clock(seconds_from_now: float) -> str:
+    try:
+        t = time.localtime(time.time() + max(0.0, seconds_from_now))
+        return time.strftime("%H:%M", t)
+    except Exception:
+        return "?"
+
+
+def _rl_emit(agent: Any, message: str) -> None:
+    """Best-effort user-facing status — reaches Telegram via status_callback."""
+    try:
+        emit = getattr(agent, "_emit_status", None)
+        if callable(emit):
+            emit(message)
+            return
+    except Exception:
+        pass
+    try:
+        logger.warning("[rl-autowait] %s", message)
+    except Exception:
+        pass
+
+
+def _rl_touch(agent: Any, desc: str) -> None:
+    """Bump the agent's liveness signal so the gateway inactivity timer
+    doesn't kill us mid-wait.
+
+    The gateway polls ``get_activity_summary()["seconds_since_activity"]``
+    every few seconds and aborts the run when it exceeds
+    ``agent.gateway_timeout`` (default 1800s = 30 min).  Without a tick here,
+    a long rate-limit wait (up to ``HERMES_RL_AUTOWAIT_MAX_S`` = 6h) silently
+    trips the timeout while we're just sleeping.  Calling the agent's own
+    ``_touch_activity`` resets ``seconds_since_activity`` to ~0; it never
+    raises, and is a no-op when the agent predates this method.
+    """
+    try:
+        touch = getattr(agent, "_touch_activity", None)
+        if callable(touch):
+            touch(desc)
+    except Exception:
+        # Liveness tick must never break the wait.
+        logger.debug("[rl-autowait] touch_activity failed", exc_info=True)
+
+
+def _rl_interrupted(agent: Any) -> bool:
+    """True if the user asked to stop — so we abort the wait promptly."""
+    if getattr(agent, "_interrupt_requested", False):
+        return True
+    try:
+        from tools.interrupt import is_interrupted as _is_int  # type: ignore
+        tid = getattr(agent, "_execution_thread_id", None)
+        return bool(_is_int(tid)) if tid is not None else bool(_is_int())
+    except Exception:
+        return False
+
+
+# Per-window safety caps.  These are independent of the legacy
+# ``HERMES_RL_AUTOWAIT_MAX_S`` knob: when Anthropic tells us *which* window
+# tripped (via ``anthropic-ratelimit-unified-{5h,1d,7d}-status``), we use
+# the matching cap; otherwise we fall back to ``HERMES_RL_AUTOWAIT_MAX_S``.
+# Defaults (all in seconds):
+#   5h → 6h  (current behaviour — short enough that the gateway watchdog
+#             can be tuned up if needed, but long enough to span any 5h window)
+#   1d → 26h (daily cap with a 2h buffer for clock drift / reset skew)
+#   7d → 7.5d (≈648000s — weekly Anthropic Pro reset + 12h safety)
+_RL_WINDOW_DEFAULTS_S: dict = {
+    "5h": 6 * 3600,         # 21600
+    "1d": 26 * 3600,        # 93600
+    "7d": int(7.5 * 86400),  # 648000
+}
+_RL_WINDOW_LABEL: dict = {
+    "5h": "de 5h (Pro/Max)",
+    "1d": "diária (1d)",
+    "7d": "semanal (7d)",
+}
+
+
+def _rl_window_cap(window: "str | None") -> int:
+    """Return the per-window safety cap in seconds.
+
+    ``window`` is one of ``"5h"``/``"1d"``/``"7d"`` (Anthropic's exact
+    suffix) or ``None`` (caller couldn't tell which window tripped — we
+    fall back to the legacy ``HERMES_RL_AUTOWAIT_MAX_S`` knob, default 6h).
+    """
+    if window is not None and window in _RL_WINDOW_DEFAULTS_S:
+        return _rl_env_int(
+            f"HERMES_RL_AUTOWAIT_MAX_{window.upper()}_S",
+            _RL_WINDOW_DEFAULTS_S[window],
+        )
+    return _rl_env_int("HERMES_RL_AUTOWAIT_MAX_S", 21600)  # 6h fallback
+
+
+def _rl_sleep_until_reset(agent: Any, exc: Exception, attempt: int) -> bool:
+    """Sleep until the rate-limit window resets.  Returns True if we waited
+    (caller should retry), False if we should re-raise (cap hit / interrupted /
+    unparseable with auto-wait disabled)."""
+    buffer_s = _rl_env_int("HERMES_RL_AUTOWAIT_BUFFER_S", 5)
+    default_s = _rl_env_int("HERMES_RL_AUTOWAIT_DEFAULT_S", 300)
+
+    window, reset = _rl_seconds_until_reset(exc)
+    if reset is None:
+        # No parseable reset header.  Use a conservative default so we still
+        # recover from subscription-window 429s that omit the header.
+        reset = float(default_s)
+        had_header = False
+    else:
+        had_header = True
+    max_wait = _rl_window_cap(window)
+    wait_s = min(reset + buffer_s, float(max_wait))
+
+    if wait_s <= 0:
+        return True  # already reset — retry immediately
+
+    if reset + buffer_s > max_wait:
+        label = _RL_WINDOW_LABEL.get(window or "", "de uso") if window else "de uso"
+        _rl_emit(
+            agent,
+            f"⏱️ Quota Claude (janela {label}) esgotada, mas o reset é só "
+            f"daqui a {_rl_fmt_eta(reset)} — acima do safety-cap "
+            f"({_rl_fmt_eta(max_wait)}). A parar.",
+        )
+        return False
+
+    eta = _rl_fmt_eta(wait_s)
+    clock = _rl_local_clock(wait_s)
+    src = "" if had_header else " (estimativa)"
+    if window and window in _RL_WINDOW_LABEL:
+        window_msg = f" ({_RL_WINDOW_LABEL[window]})"
+    else:
+        window_msg = ""
+    _rl_emit(
+        agent,
+        f"⏸ Quota Claude{window_msg} esgotada. A aguardar o reset da janela "
+        f"≈{eta}{src} (retomo por volta das {clock}). A dormir…",
+    )
+
+    # Touch activity once before sleeping so the gateway sees the wait
+    # as legitimate activity rather than a hung API call.  Then refresh
+    # the liveness signal every ~25s inside the chunk loop — well under
+    # the default gateway_timeout (1800s) and gateway_timeout_warning
+    # (900s), so neither the warning nor the kill fires.
+    touch_desc = f"auto-waiting for Claude {window or 'unified'} rate-limit reset (≈{eta})"
+    _rl_touch(agent, touch_desc)
+    last_touch = time.monotonic()
+    _TOUCH_INTERVAL_S = 25.0
+
+    deadline = time.time() + wait_s
+    # Sleep in short chunks so a user interrupt (or /stop) breaks out quickly.
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        if _rl_interrupted(agent):
+            _rl_emit(agent, "⏹ Interrompido durante a espera pela quota — a parar.")
+            return False
+        time.sleep(min(5.0, remaining))
+        # Refresh liveness periodically.  Cheap and best-effort.
+        if time.monotonic() - last_touch >= _TOUCH_INTERVAL_S:
+            last_touch = time.monotonic()
+            remaining_str = _rl_fmt_eta(max(0.0, deadline - time.time()))
+            _rl_touch(
+                agent,
+                f"auto-waiting for Claude {window or 'unified'} rate-limit reset "
+                f"(≈{remaining_str} left)",
+            )
+
+    _rl_emit(agent, "▶ Quota reposta — a retomar a execução.")
+    return True
+
+
+def _rl_wrap_call(original_method):
+    """Wrap an AIAgent API-call method with subscription rate-limit auto-wait."""
+
+    def wrapper(self, *args: Any, **kwargs: Any):
+        if not _rl_autowait_enabled():
+            return original_method(self, *args, **kwargs)
+        attempt = 0
+        while True:
+            try:
+                return original_method(self, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it's a 429 we handle
+                if not _rl_is_rate_limit_error(exc):
+                    raise
+                attempt += 1
+                # Decide whether to wait-and-retry or give up (re-raise so
+                # Hermes core's normal handling/give-up path takes over).
+                try:
+                    should_retry = _rl_sleep_until_reset(self, exc, attempt)
+                except Exception:
+                    logger.debug("[rl-autowait] sleep handler error", exc_info=True)
+                    should_retry = False
+                if not should_retry:
+                    raise
+                # loop and retry the identical call
+
+    wrapper.__name__ = getattr(original_method, "__name__", "interruptible_api_call")
+    wrapper.__qualname__ = getattr(original_method, "__qualname__", wrapper.__name__)
+    wrapper.__doc__ = getattr(original_method, "__doc__", None)
+    wrapper.__wrapped__ = original_method  # type: ignore[attr-defined]
+    return wrapper
+
+
+def install_rate_limit_autowait(run_agent_module: Any = None) -> bool:
+    """Patch ``run_agent.AIAgent`` so subscription-window 429s wait-and-resume.
+
+    Idempotent.  Returns True if installed (or already installed), False if the
+    target class/methods are missing (API drift) — in which case the original
+    behaviour is untouched.
+    """
+    ram = run_agent_module
+    if ram is None:
+        try:
+            import run_agent as ram  # type: ignore[no-redef]
+        except Exception as exc:
+            logger.debug("[rl-autowait] cannot import run_agent: %s", exc)
+            return False
+
+    agent_cls = getattr(ram, "AIAgent", None)
+    if agent_cls is None:
+        logger.debug("[rl-autowait] run_agent.AIAgent missing; skipping")
+        return False
+    if getattr(agent_cls, _RL_AUTOWAIT_PATCHED_FLAG, False):
+        return True
+
+    patched_any = False
+    for name in ("_interruptible_api_call", "_interruptible_streaming_api_call"):
+        original = getattr(agent_cls, name, None)
+        if not callable(original):
+            continue
+        setattr(agent_cls, name, _rl_wrap_call(original))
+        patched_any = True
+        logger.info("[rl-autowait] wrapped AIAgent.%s", name)
+
+    if not patched_any:
+        return False
+    setattr(agent_cls, _RL_AUTOWAIT_PATCHED_FLAG, True)
+    logger.debug("[rl-autowait] subscription rate-limit auto-wait installed")
+    return True
+
+
 def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     """Install the bypass on hermes-agent's anthropic adapter.
 
@@ -830,4 +1405,21 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     sys.stderr.write("[anthropic_billing_bypass] Bypass installed\n")
 
     _install_response_pascalcase_unhook(aa)
+
+    # Window-aware subscription rate-limit auto-wait (ported from
+    # hermes-claude-auth PR #27).  Never fatal: a failure here must not
+    # break the billing bypass itself.
+    try:
+        if _rl_autowait_enabled():
+            if install_rate_limit_autowait():
+                sys.stderr.write(
+                    "[anthropic_billing_bypass] Rate-limit auto-wait installed\n"
+                )
+        else:
+            logger.debug("[rl-autowait] disabled via HERMES_RL_AUTOWAIT")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "install_rate_limit_autowait raised %s: %s", type(exc).__name__, exc
+        )
+
     return True

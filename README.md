@@ -36,7 +36,56 @@ What `install.sh` does:
 ./uninstall.sh --purge  # remove hook + patch file
 ```
 
-## How it works
+## Surviving `hermes update` (auto-recovery)
+
+`hermes update` can wipe the loader from the venv's `site-packages/` in two
+ways:
+
+1. **`git merge` / `git checkout`** of the hermes-agent repo — triggers git
+   hooks, but the default `.git/hooks/` dir is *inside* the repo and gets
+   **stashed** by the update's `git stash` step, so hooks there don't fire at
+   the right time.
+2. **Venv rebuild** — the update provisions a fresh Python runtime, which
+   deletes `sitecustomize.py` outright. No git hook covers this.
+
+### Two-layer defense
+
+**Layer 1 — git hooks via `core.hooksPath` (outside the repo):**
+
+```bash
+# From inside your hermes-agent checkout:
+mkdir -p "$LOCALAPPDATA/hermes/git-hooks"
+cp post-merge.hook.sh "$LOCALAPPDATA/hermes/git-hooks/post-merge"
+cp post-checkout.hook.sh "$LOCALAPPDATA/hermes/git-hooks/post-checkout"
+chmod +x "$LOCALAPPDATA/hermes/git-hooks/post-"*
+git config core.hooksPath "$LOCALAPPDATA/hermes/git-hooks"
+```
+
+Because the hooks live *outside* `.git/hooks/`, the update's `git stash`
+can't touch them, and `core.hooksPath` makes git use them for every
+merge/checkout.
+
+**Layer 2 — watchdog cron (covers venv rebuild):**
+
+```bash
+# Hermes cron runs restore_loader.sh every 15m; it re-copies the loader
+# from $LOCALAPPDATA/hermes/patches/sitecustomize.py if it's missing.
+hermes cron create "every 15m" --name restore-claude-auth-loader \
+  --no-agent --script restore_loader.sh --deliver local
+```
+
+The cron job only fires while the Hermes gateway is running — after an update,
+the loader is restored within ≤15 minutes of the gateway coming back up.
+
+Both layers are idempotent and never break the update. The canonical loader
+lives at `$LOCALAPPDATA/hermes/patches/sitecustomize.py` (outside any repo).
+
+> **Windows note:** hooks are POSIX shell scripts run under Git Bash (ships
+> with Git for Windows). The cron script uses `uname` to resolve paths and
+> works under the Hermes gateway's environment.
+
+
+
 1. **Billing header**: SHA-256 signed `x-anthropic-billing-header` injected as `system[0]`
 2. **System prompt relocation**: Non-identity system entries moved to the first user message as `<system-reminder>` blocks
 3. **Beta flags**: Adds `prompt-caching-scope-2026-01-05` and `advisor-tool-2026-03-01`
@@ -51,6 +100,51 @@ Installed through a `.pth` file in the venv's site-packages that imports a small
 
 The `.pth` shim runs *before* `site.py` imports `sitecustomize`, on every platform. An earlier version of this installer wrote a `sitecustomize.py` into site-packages directly, which failed silently on Debian/Ubuntu — those distros ship `/usr/lib/pythonX.Y/sitecustomize.py` for apport and it wins import priority over the venv-local one, so the bypass hook never ran. The current installer auto-migrates legacy installs.
 
+## Subscription rate-limit auto-wait (Claude Pro/Max windows: 5h, 1d, 7d)
+
+When a long agent run exhausts a Claude Pro/Max usage window mid-flight,
+api.anthropic.com returns HTTP 429 with a reset time in the
+`anthropic-ratelimit-unified-*-reset` headers.  Hermes core's retry loop
+caps backoff at 120s and abandons the run, surfacing "rate-limiting
+requests" on Telegram and killing the session.
+
+This patch wraps the two API-call entry points on `run_agent.AIAgent` so a
+genuine subscription-window 429 instead **sleeps until the window resets**
+(interruptibly, in short chunks) and then retries the same call transparently.
+It picks the **longest** throttled window (e.g. a 7d hit also clears the 5h
+window, so a single sleep covers both) and applies a **per-window** safety
+cap (5h=6h, 1d=26h, 7d=7.5d). Behaviour is tunable via env vars:
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `HERMES_RL_AUTOWAIT` | `1` | `0` disables auto-wait entirely |
+| `HERMES_RL_AUTOWAIT_MAX_S` | `21600` | fallback cap (s) when no window detected |
+| `HERMES_RL_AUTOWAIT_MAX_5H_S` | `21600` | 5h-window safety cap (6h) |
+| `HERMES_RL_AUTOWAIT_MAX_1D_S` | `93600` | 1d-window safety cap (26h) |
+| `HERMES_RL_AUTOWAIT_MAX_7D_S` | `648000` | 7d-window safety cap (7.5d) |
+| `HERMES_RL_AUTOWAIT_BUFFER_S` | `5` | pad added after reset |
+| `HERMES_RL_AUTOWAIT_DEFAULT_S` | `300` | wait when no reset header found |
+
+The wait loop also calls `agent._touch_activity(...)` every ~25s so the
+gateway's inactivity watchdog doesn't kill the agent mid-wait.  Idempotent
+and never breaks the billing path: if anything goes wrong, the original
+call/exception behaviour is preserved.
+
+Ported from kristianvast/hermes-claude-auth PR #27 (window-aware auto-wait);
+the fingerprint parity fix below from PR #21.
+
+## Fingerprint parity (avoids "extra usage" billing)
+
+Anthropic's validator cross-references the `user-agent` header and the
+`cc_version=` field in the billing header.  If the SDK client sends
+`claude-cli/<ver> (external, cli)` while the billing header claims
+`cc_entrypoint=sdk-cli`, the request is flagged as third-party and routed to
+pay-per-token **extra usage** instead of your Max/Pro plan
+(`HTTP 400 You're out of extra usage`).  This patch pins the Claude Code
+version to `2.1.112` for **both** the user-agent and the signed billing
+header, and forces `x-app: cli`, eliminating the drift that triggered
+upstream issue #6.
+
 ## What gets modified
 | File | Action |
 |------|--------|
@@ -62,15 +156,68 @@ The `.pth` shim runs *before* `site.py` imports `sitecustomize`, on every platfo
 
 ## Compatibility
 - Tested with hermes-agent on Python 3.11+
-- Linux and macOS
+- Linux, macOS, and **Windows** (native: `%LOCALAPPDATA%\hermes`; the bypass
+  patch lives at `%LOCALAPPDATA%\hermes\patches\anthropic_billing_bypass.py`)
+- **Multiple profiles**: Hermes supports `profiles/<name>/` under the data
+  root. The patch is installed once at the data root and shared by every
+  profile; `HERMES_HOME` may point at a profile dir and the loader still
+  resolves the patch correctly.
 - Depends on `build_anthropic_kwargs(is_oauth=...)` in `agent.anthropic_adapter`, so it may need updating if hermes-agent changes that interface
 
-## Troubleshooting
+## Verifying the bypass is active (not falling back to extra usage)
+
+After install, confirm Hermes is using the subscription path and not silently
+billing pay-per-token:
+
+1. **Startup log** — look for these lines in the Hermes gateway log
+   (`%LOCALAPPDATA%\hermes\logs\` on Windows):
+   ```
+   [anthropic_billing_bypass] Bypass installed
+   [anthropic_billing_bypass] Transport unwrap hook installed
+   [anthropic_billing_bypass] Rate-limit auto-wait installed
+   ```
+2. **No `extra usage` errors** — if you see `HTTP 400 You're out of extra
+   usage` or `HTTP 429 ... extra usage required`, the fingerprint drifted and
+   the request was routed to the pay-per-token bucket. Re-run `install.sh`.
+3. **Token flow** — calls should succeed with `provider=anthropic` in
+   `agent.log` and normal in/out token counts (not 429s).
+
+> **Dynamic version detection:** This build detects the installed Claude Code
+> version automatically (via `claude --version`) and uses it for both the
+> user-agent and the signed billing header. No manual pinning — when you
+> update Claude Code, the bypass follows on the next Hermes start. Falls back
+> to `_PINNED_CC_VERSION` (`2.1.112`) only if Claude Code isn't on PATH.
+> This replaces the static pin from upstream PR #21 and removes the drift that
+> triggered issue #6.
+
+## Known limitations (upstream PRs not yet ported)
+
+This fork intentionally does **not** include some open upstream PRs. Status:
+
+- **PR #23** (thinking replay / tool repair hardening, +1296): fixes HTTP 400 on
+  mutated `thinking` / `redacted_thinking` blocks in long Opus conversations.
+  Not ported — large diff against our `v1.5.1+rl-autodetect` base and our
+  bypass already strips `thinking['effort']` + temperature. If you hit HTTP 400
+  with `thinking` blocks, port `_strip_thinking_from_replay` from #23.
+- **PR #24** (full Windows + Credential Manager mirroring, +437): not ported —
+  conflicts with our profile-aware loader (Fix A) and our two-layer auto-recovery
+  already covers Windows installs + venv rebuilds. Only the `.ps1` installers
+  would be additive; not needed since `core.hooksPath` + cron handle it.
+- **PR #15 / #10** (wire-format 2.1.117 / 2.1.123): not ported — our dynamic
+  version detection already advertises whatever Claude Code is actually
+  installed, so we're never behind the wire format.
+- **PR #20** (per-pool `account_uuid`): only relevant for multi-account Claude
+  credential pools; single-account setups don't need it.
+- **PR #16** (.pth shim for Debian/Ubuntu apport): only relevant on Debian/Ubuntu
+  where a system `sitecustomize.py` wins import priority; Windows/macOS unaffected.
+
+
 
 ### Install issues
-- **"hermes-agent not found"**: Make sure Hermes is installed at `$HERMES_HOME/hermes-agent/` (defaults to `~/.hermes/hermes-agent/`)
+- **"hermes-agent not found"**: Make sure Hermes is installed at `$HERMES_HOME/hermes-agent/` (defaults to `~/.hermes/hermes-agent/`) or `%LOCALAPPDATA%\hermes\hermes-agent\` (Windows)
 - **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
-- **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **"ModuleNotFoundError: No module named 'anthropic_billing_bypass'"** on every startup: the hook couldn't find the patch. This happens when `HERMES_HOME` points at a **profile** directory (`.../hermes/profiles/<name>`) but the patch lives at the data root. The bootstrap resolves that case automatically — re-run `./install.sh` to pick it up.
+- **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` (Linux) or the Hermes log under `%LOCALAPPDATA%\hermes\logs\` (Windows) for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
 - **Bypass silently inactive on Debian/Ubuntu** (legacy `sitecustomize.py` installs only): If you installed before the `.pth` migration, the bypass may never have actually run on your host. Debian/Ubuntu ship `/usr/lib/pythonX.Y/sitecustomize.py` for apport, and that one wins import priority over the venv-local `sitecustomize.py`, so the hook never installs. Quick diagnostic:
 
   ```bash

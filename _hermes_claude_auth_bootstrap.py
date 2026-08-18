@@ -3,10 +3,10 @@ hermes-claude-auth bootstrap — Claude Code OAuth bypass for hermes-agent.
 =======================================================================
 
 This file is installed into the hermes-agent venv's site-packages as
-``_hermes_claude_auth_bootstrap.py`` by ``install.sh``.  It is imported at
-interpreter startup by a sibling ``hermes_claude_auth.pth`` file, then hooks
-the import of ``agent.anthropic_adapter`` so that the billing bypass patch
-is applied immediately after the module loads.
+``_hermes_claude_auth_bootstrap.py`` by ``install.sh`` or ``install.ps1``.
+It is imported at interpreter startup by a sibling ``hermes_claude_auth.pth``
+file, then hooks the import of ``agent.anthropic_adapter`` so that the billing
+bypass patch is applied immediately after the module loads.
 
 Why ``.pth`` + bootstrap rather than ``sitecustomize.py``
 ---------------------------------------------------------
@@ -38,10 +38,64 @@ from __future__ import annotations
 import os
 import sys
 
-_PATCHES_DIR = os.environ.get(
-    "HERMES_PATCHES_DIR",
-    os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "patches"),
-)
+def _candidate_hermes_homes() -> list[str]:
+    """Return every plausible Hermes data dir, most specific first.
+
+    ``HERMES_HOME`` may point at a *profile* directory
+    (``...\\hermes\\profiles\\<name>``) rather than the install root.
+    Patches are installed once at the root, so a profile-scoped
+    HERMES_HOME must still fall back to the root — otherwise the
+    bypass silently fails to import (ModuleNotFoundError).
+    """
+    homes: list[str] = []
+
+    def _add(path: str | None) -> None:
+        if path:
+            p = os.path.abspath(os.path.expanduser(path))
+            if p not in homes:
+                homes.append(p)
+
+    configured = os.environ.get("HERMES_HOME")
+    _add(configured)
+
+    # If HERMES_HOME is a profile dir, walk up past 'profiles/<name>'.
+    if configured:
+        p = os.path.abspath(os.path.expanduser(configured))
+        parent = os.path.dirname(p)
+        if os.path.basename(parent).lower() == "profiles":
+            _add(os.path.dirname(parent))
+
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            _add(os.path.join(local_app_data, "hermes"))
+    _add("~/.hermes")
+    return homes
+
+
+def _default_hermes_home() -> str:
+    """Backwards-compatible single-value resolver."""
+    homes = _candidate_hermes_homes()
+    return homes[0] if homes else os.path.expanduser("~/.hermes")
+
+
+def _resolve_patches_dir() -> str:
+    """Pick the first patches dir that actually contains the bypass module."""
+    explicit = os.environ.get("HERMES_PATCHES_DIR")
+    if explicit:
+        return os.path.expanduser(explicit)
+
+    fallback = None
+    for home in _candidate_hermes_homes():
+        cand = os.path.join(home, "patches")
+        if fallback is None:
+            fallback = cand
+        if os.path.isfile(os.path.join(cand, "anthropic_billing_bypass.py")):
+            return cand
+    return fallback or os.path.join(_default_hermes_home(), "patches")
+
+
+_PATCHES_DIR = _resolve_patches_dir()
 _TARGET_MODULE = "agent.anthropic_adapter"
 
 if os.path.isdir(_PATCHES_DIR) and _PATCHES_DIR not in sys.path:
