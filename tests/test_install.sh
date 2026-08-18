@@ -62,23 +62,30 @@ assert_dir_not_exists() {
 }
 
 export HOME="$FAKE_HOME"
+unset HERMES_HOME
 
 mkdir -p "$FAKE_HOME/.hermes/hermes-agent"
 python3 -m venv "$FAKE_HOME/.hermes/hermes-agent/venv"
+mkdir -p "$FAKE_HOME/.hermes/hermes-agent/.git/hooks"
 
 VENV_PYTHON="$FAKE_HOME/.hermes/hermes-agent/venv/bin/python"
 SITE_PACKAGES="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
 SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
 BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
+PTH_FILE="$SITE_PACKAGES/hermes_claude_auth.pth"
+BOOTSTRAP_FILE="$SITE_PACKAGES/_hermes_claude_auth_bootstrap.py"
 PATCH_FILE="$FAKE_HOME/.hermes/patches/anthropic_billing_bypass.py"
+POST_MERGE_HOOK="$FAKE_HOME/.hermes/hermes-agent/.git/hooks/post-merge"
 
 # Test 1: Fresh install
 T1="Test 1: Fresh install"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
     assert_file_exists "$T1" "$PATCH_FILE" || ok=0
-    assert_file_exists "$T1" "$SITECUSTOMIZE" || ok=0
-    assert_file_contains "$T1" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
+    assert_file_exists "$T1" "$PTH_FILE" || ok=0
+    assert_file_exists "$T1" "$BOOTSTRAP_FILE" || ok=0
+    assert_file_contains "$T1" "$PTH_FILE" "import _hermes_claude_auth_bootstrap" || ok=0
+    assert_file_contains "$T1" "$BOOTSTRAP_FILE" "# hermes-claude-auth managed" || ok=0
     [ "$ok" -eq 1 ] && pass "$T1"
 else
     fail "$T1" "install.sh exited non-zero"
@@ -88,9 +95,9 @@ fi
 T2="Test 2: Idempotent re-install"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
-    assert_file_exists "$T2" "$SITECUSTOMIZE" || ok=0
-    assert_file_contains "$T2" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
-    count="$(grep -cF '# hermes-claude-auth managed' "$SITECUSTOMIZE" 2>/dev/null || true)"
+    assert_file_exists "$T2" "$BOOTSTRAP_FILE" || ok=0
+    assert_file_contains "$T2" "$BOOTSTRAP_FILE" "# hermes-claude-auth managed" || ok=0
+    count="$(grep -cF '# hermes-claude-auth managed' "$BOOTSTRAP_FILE" 2>/dev/null || true)"
     if [ "$count" -gt 1 ]; then
         fail "$T2" "marker duplicated ($count occurrences)"
         ok=0
@@ -100,14 +107,15 @@ else
     fail "$T2" "install.sh exited non-zero on re-run"
 fi
 
-# Test 3: Install over existing sitecustomize.py (no marker)
-T3="Test 3: Install over existing sitecustomize.py"
+# Test 3: A foreign sitecustomize.py is left untouched (.pth shim sidesteps it)
+T3="Test 3: Install leaves foreign sitecustomize.py untouched"
 printf 'import sys\n# some unrelated hook\n' > "$SITECUSTOMIZE"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
-    assert_file_exists "$T3" "$BACKUP" || ok=0
-    assert_file_contains "$T3" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
-    assert_file_contains "$T3" "$BACKUP" "# some unrelated hook" || ok=0
+    assert_file_exists "$T3" "$PTH_FILE" || ok=0
+    assert_file_exists "$T3" "$BOOTSTRAP_FILE" || ok=0
+    assert_file_contains "$T3" "$SITECUSTOMIZE" "# some unrelated hook" || ok=0
+    assert_file_not_exists "$T3" "$BACKUP" || ok=0
     [ "$ok" -eq 1 ] && pass "$T3"
 else
     fail "$T3" "install.sh exited non-zero"
@@ -120,6 +128,8 @@ if "$REPO_DIR/uninstall.sh" >/dev/null 2>&1; then
     assert_file_exists "$T4" "$SITECUSTOMIZE" || ok=0
     assert_file_contains "$T4" "$SITECUSTOMIZE" "# some unrelated hook" || ok=0
     assert_file_not_exists "$T4" "$BACKUP" || ok=0
+    assert_file_not_exists "$T4" "$PTH_FILE" || ok=0
+    assert_file_not_exists "$T4" "$BOOTSTRAP_FILE" || ok=0
     assert_file_exists "$T4" "$PATCH_FILE" || ok=0
     [ "$ok" -eq 1 ] && pass "$T4"
 else
@@ -131,7 +141,8 @@ T5="Test 5: Reinstall then uninstall --purge"
 rm -f "$SITECUSTOMIZE"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1 && "$REPO_DIR/uninstall.sh" --purge >/dev/null 2>&1; then
     ok=1
-    assert_file_not_exists "$T5" "$SITECUSTOMIZE" || ok=0
+    assert_file_not_exists "$T5" "$PTH_FILE" || ok=0
+    assert_file_not_exists "$T5" "$BOOTSTRAP_FILE" || ok=0
     assert_file_not_exists "$T5" "$PATCH_FILE" || ok=0
     assert_dir_not_exists "$T5" "$FAKE_HOME/.hermes/patches" || ok=0
     [ "$ok" -eq 1 ] && pass "$T5"
@@ -223,6 +234,51 @@ if PATH="$FAKE_BIN:$PATH" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     assert_file_not_exists "$T8" "$FAKE_HOME/.claude/.credentials.json" && pass "$T8"
 else
     fail "$T8" "install.sh exited non-zero when Keychain entry absent"
+fi
+
+# Test 9: Custom HERMES_HOME is respected
+T9="Test 9: Custom HERMES_HOME respected"
+CUSTOM_HERMES_HOME="$(mktemp -d)"
+trap 'rm -rf "$FAKE_HOME" "$CUSTOM_HERMES_HOME"' EXIT
+mkdir -p "$CUSTOM_HERMES_HOME/hermes-agent"
+python3 -m venv "$CUSTOM_HERMES_HOME/hermes-agent/venv"
+CUSTOM_VENV_PYTHON="$CUSTOM_HERMES_HOME/hermes-agent/venv/bin/python"
+CUSTOM_SITE_PACKAGES="$("$CUSTOM_VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
+CUSTOM_PATCH_FILE="$CUSTOM_HERMES_HOME/patches/anthropic_billing_bypass.py"
+CUSTOM_PTH_FILE="$CUSTOM_SITE_PACKAGES/hermes_claude_auth.pth"
+CUSTOM_BOOTSTRAP_FILE="$CUSTOM_SITE_PACKAGES/_hermes_claude_auth_bootstrap.py"
+if HERMES_HOME="$CUSTOM_HERMES_HOME" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    ok=1
+    assert_file_exists "$T9" "$CUSTOM_PATCH_FILE" || ok=0
+    assert_file_exists "$T9" "$CUSTOM_PTH_FILE" || ok=0
+    assert_file_exists "$T9" "$CUSTOM_BOOTSTRAP_FILE" || ok=0
+    assert_file_contains "$T9" "$CUSTOM_BOOTSTRAP_FILE" "# hermes-claude-auth managed" || ok=0
+    [ "$ok" -eq 1 ] && pass "$T9"
+else
+    fail "$T9" "install.sh exited non-zero with custom HERMES_HOME"
+fi
+
+# Test 10: A second hermes-capable interpreter ($HERMES_PYTHON) also gets the hook
+T10="Test 10: Secondary interpreter that imports hermes-agent gets the hook"
+ALT_ROOT="$(mktemp -d)"
+trap 'rm -rf "$FAKE_HOME" "$CUSTOM_HERMES_HOME" "$ALT_ROOT"' EXIT
+python3 -m venv "$ALT_ROOT/venv"
+ALT_PYTHON="$ALT_ROOT/venv/bin/python"
+ALT_SITE_PACKAGES="$("$ALT_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
+mkdir -p "$ALT_SITE_PACKAGES/agent"
+printf '' > "$ALT_SITE_PACKAGES/agent/__init__.py"
+printf 'build_anthropic_kwargs = None\n' > "$ALT_SITE_PACKAGES/agent/anthropic_adapter.py"
+ALT_PTH_FILE="$ALT_SITE_PACKAGES/hermes_claude_auth.pth"
+ALT_BOOTSTRAP_FILE="$ALT_SITE_PACKAGES/_hermes_claude_auth_bootstrap.py"
+if HERMES_PYTHON="$ALT_PYTHON" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    ok=1
+    assert_file_exists "$T10" "$PTH_FILE" || ok=0
+    assert_file_exists "$T10" "$ALT_PTH_FILE" || ok=0
+    assert_file_exists "$T10" "$ALT_BOOTSTRAP_FILE" || ok=0
+    assert_file_contains "$T10" "$ALT_BOOTSTRAP_FILE" "# hermes-claude-auth managed" || ok=0
+    [ "$ok" -eq 1 ] && pass "$T10"
+else
+    fail "$T10" "install.sh exited non-zero with HERMES_PYTHON set"
 fi
 
 TOTAL=$((PASS + FAIL))
