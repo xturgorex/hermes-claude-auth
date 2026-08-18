@@ -62,44 +62,84 @@ rm -rf "$PATCHES_DIR/__pycache__" 2>/dev/null || true
 # priority over the venv-local one (the venv's never gets imported).  Routing
 # through a .pth shim avoids the collision and works on every distro.
 
+install_hook_into() {
+    local site_packages="$1"
+    local bootstrap_path="$site_packages/$BOOTSTRAP_NAME"
+    local pth_path="$site_packages/$PTH_NAME"
+
+    cp "$SCRIPT_DIR/$BOOTSTRAP_NAME" "$bootstrap_path" || return 1
+    chmod 644 "$bootstrap_path"
+    printf "${GREEN}[✓] Installed bootstrap module into %s${RESET}\n" "$bootstrap_path"
+
+    cp "$SCRIPT_DIR/$PTH_NAME" "$pth_path" || return 1
+    chmod 644 "$pth_path"
+    printf "${GREEN}[✓] Installed .pth shim into %s${RESET}\n" "$pth_path"
+
+    # Migrate an existing sitecustomize.py-style install, if any.
+    #
+    # - If we placed it there in a previous install (marker present), remove it and
+    #   restore the original pre-existing sitecustomize.py from backup if one was
+    #   saved.  Without the .pth shim, that file is dead weight on Debian/Ubuntu
+    #   anyway, and on Fedora having both works but ours is now redundant.
+    # - If a non-ours sitecustomize.py exists, leave it untouched.
+    local sitecustomize="$site_packages/sitecustomize.py"
+    local legacy_backup="$sitecustomize.pre-hermes-claude-auth"
+    if [ -f "$sitecustomize" ] && grep -q "$MARKER" "$sitecustomize"; then
+        if [ -f "$legacy_backup" ]; then
+            mv "$legacy_backup" "$sitecustomize"
+            printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — restored your original from backup${RESET}\n"
+        else
+            # No prior sitecustomize.py existed; remove ours so future runs of /usr/bin/python
+            # don't have a stray hook in this venv after this package is uninstalled.
+            rm -f "$sitecustomize"
+            printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — removed superseded hook${RESET}\n"
+        fi
+    fi
+
+    # Clear any stale bytecode for our installed files so the next interpreter
+    # startup re-imports them.
+    find "$site_packages" \
+        -maxdepth 3 \
+        \( -name '_hermes_claude_auth_bootstrap*.pyc' -o -name 'sitecustomize*.pyc' \) \
+        -delete 2>/dev/null || true
+}
+
+site_packages_of() {
+    "$1" -c "import site; print(site.getsitepackages()[0] if site.getsitepackages() else site.getusersitepackages())" 2>/dev/null || true
+}
+
 BOOTSTRAP_PATH="$SITE_PACKAGES/$BOOTSTRAP_NAME"
 PTH_PATH="$SITE_PACKAGES/$PTH_NAME"
+install_hook_into "$SITE_PACKAGES"
 
-cp "$SCRIPT_DIR/$BOOTSTRAP_NAME" "$BOOTSTRAP_PATH"
-chmod 644 "$BOOTSTRAP_PATH"
-printf "${GREEN}[✓] Installed bootstrap module into %s${RESET}\n" "$BOOTSTRAP_PATH"
-
-cp "$SCRIPT_DIR/$PTH_NAME" "$PTH_PATH"
-chmod 644 "$PTH_PATH"
-printf "${GREEN}[✓] Installed .pth shim into %s${RESET}\n" "$PTH_PATH"
-
-# Migrate an existing sitecustomize.py-style install, if any.
-#
-# - If we placed it there in a previous install (marker present), remove it and
-#   restore the original pre-existing sitecustomize.py from backup if one was
-#   saved.  Without the .pth shim, that file is dead weight on Debian/Ubuntu
-#   anyway, and on Fedora having both works but ours is now redundant.
-# - If a non-ours sitecustomize.py exists, leave it untouched.
-SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
-LEGACY_BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
-if [ -f "$SITECUSTOMIZE" ] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
-    if [ -f "$LEGACY_BACKUP" ]; then
-        mv "$LEGACY_BACKUP" "$SITECUSTOMIZE"
-        printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — restored your original from backup${RESET}\n"
-    else
-        # No prior sitecustomize.py existed; remove ours so future runs of /usr/bin/python
-        # don't have a stray hook in this venv after this package is uninstalled.
-        rm -f "$SITECUSTOMIZE"
-        printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — removed superseded hook${RESET}\n"
+# hermes-agent is frequently installed editable into a *different* interpreter
+# than the gateway venv (e.g. the CLI runs from mise's python3.11 while the
+# daemon runs from ~/.hermes/hermes-agent/venv).  Both must load the hook, so
+# additionally install into any other interpreter that can import hermes-agent.
+# Best-effort: a read-only or unwritable site-packages is skipped, never fatal.
+# Ported from PR #21, adapted to the .pth mechanism.
+INSTALLED_SITES="$SITE_PACKAGES"
+for candidate in \
+    "${HERMES_PYTHON:-}" \
+    "$(command -v hermes >/dev/null 2>&1 && head -n 1 "$(command -v hermes)" 2>/dev/null | sed -n 's/^#!\([^ ]*\).*/\1/p')" \
+    "$(command -v python 2>/dev/null || true)" \
+    "$(command -v python3 2>/dev/null || true)"
+do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    "$candidate" -c "import agent.anthropic_adapter" >/dev/null 2>&1 || continue
+    candidate_site="$(site_packages_of "$candidate")"
+    [ -n "$candidate_site" ] && [ -d "$candidate_site" ] || continue
+    case ":$INSTALLED_SITES:" in
+        *":$candidate_site:"*) continue ;;
+    esac
+    if [ ! -w "$candidate_site" ]; then
+        printf "${YELLOW}[!] Skipping %s (not writable)${RESET}\n" "$candidate_site"
+        continue
     fi
-fi
-
-# Clear any stale bytecode for our installed files so the next interpreter
-# startup re-imports them.
-find "$SITE_PACKAGES" \
-    -maxdepth 3 \
-    \( -name '_hermes_claude_auth_bootstrap*.pyc' -o -name 'sitecustomize*.pyc' \) \
-    -delete 2>/dev/null || true
+    if install_hook_into "$candidate_site"; then
+        INSTALLED_SITES="$INSTALLED_SITES:$candidate_site"
+    fi
+done
 
 # macOS: hermes-agent reads Claude subscription credentials from
 # ~/.claude/.credentials.json, but Claude Code on macOS stores them in

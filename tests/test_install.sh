@@ -256,6 +256,29 @@ else
     fail "$T9" "install.sh exited non-zero with custom HERMES_HOME"
 fi
 
+# Test 10: A second hermes-capable interpreter ($HERMES_PYTHON) also gets the hook
+T10="Test 10: Secondary interpreter that imports hermes-agent gets the hook"
+ALT_ROOT="$(mktemp -d)"
+trap 'rm -rf "$FAKE_HOME" "$CUSTOM_HERMES_HOME" "$ALT_ROOT"' EXIT
+python3 -m venv "$ALT_ROOT/venv"
+ALT_PYTHON="$ALT_ROOT/venv/bin/python"
+ALT_SITE_PACKAGES="$("$ALT_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
+mkdir -p "$ALT_SITE_PACKAGES/agent"
+printf '' > "$ALT_SITE_PACKAGES/agent/__init__.py"
+printf 'build_anthropic_kwargs = None\n' > "$ALT_SITE_PACKAGES/agent/anthropic_adapter.py"
+ALT_PTH_FILE="$ALT_SITE_PACKAGES/hermes_claude_auth.pth"
+ALT_BOOTSTRAP_FILE="$ALT_SITE_PACKAGES/_hermes_claude_auth_bootstrap.py"
+if HERMES_PYTHON="$ALT_PYTHON" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    ok=1
+    assert_file_exists "$T10" "$PTH_FILE" || ok=0
+    assert_file_exists "$T10" "$ALT_PTH_FILE" || ok=0
+    assert_file_exists "$T10" "$ALT_BOOTSTRAP_FILE" || ok=0
+    assert_file_contains "$T10" "$ALT_BOOTSTRAP_FILE" "# hermes-claude-auth managed" || ok=0
+    [ "$ok" -eq 1 ] && pass "$T10"
+else
+    fail "$T10" "install.sh exited non-zero with HERMES_PYTHON set"
+fi
+
 TOTAL=$((PASS + FAIL))
 printf '\n%d/%d tests passed\n' "$PASS" "$TOTAL"
 [ "$FAIL" -eq 0 ]
