@@ -5,8 +5,12 @@ hermes-claude-auth bootstrap — Claude Code OAuth bypass for hermes-agent.
 This file is installed into the hermes-agent venv's site-packages as
 ``_hermes_claude_auth_bootstrap.py`` by ``install.sh`` or ``install.ps1``.
 It is imported at interpreter startup by a sibling ``hermes_claude_auth.pth``
-file, then hooks the import of ``agent.anthropic_adapter`` so that the billing
-bypass patch is applied immediately after the module loads.
+file, then hooks both:
+
+- ``agent.error_classifier`` so Anthropic thinking-replay 400s are classified
+  as recoverable before ``agent.conversation_loop`` binds ``classify_api_error``.
+- ``agent.anthropic_adapter`` so OAuth billing/tool-name bypass behavior is
+  applied immediately after the adapter loads.
 
 Why ``.pth`` + bootstrap rather than ``sitecustomize.py``
 ---------------------------------------------------------
@@ -102,7 +106,7 @@ if os.path.isdir(_PATCHES_DIR) and _PATCHES_DIR not in sys.path:
     sys.path.insert(0, _PATCHES_DIR)
 
 
-def _install_hook() -> None:
+def _make_import_hook(target_module, patcher_fn, label):  # type: ignore[no-untyped-def]
     try:
         from importlib.abc import MetaPathFinder
         from importlib.util import find_spec
@@ -113,7 +117,7 @@ def _install_hook() -> None:
         _patched = False
 
         def find_spec(self, fullname, path=None, target=None):  # type: ignore[override]
-            if fullname != _TARGET_MODULE or self._patched:
+            if fullname != target_module or self._patched:
                 return None
 
             # Temporarily remove ourselves to avoid recursion during find_spec.
@@ -138,15 +142,12 @@ def _install_hook() -> None:
                 original_exec(module)
                 finder._patched = True
                 try:
-                    import anthropic_billing_bypass
-
-                    anthropic_billing_bypass.apply_patches(module)
+                    patcher_fn(module)
                 except Exception as exc:
                     import traceback
 
                     sys.stderr.write(
-                        f"[hermes-claude-auth] bypass failed: "
-                        f"{type(exc).__name__}: {exc}\n"
+                        f"[{label}] bypass failed: {type(exc).__name__}: {exc}\n"
                     )
                     traceback.print_exc(file=sys.stderr)
 
@@ -156,7 +157,51 @@ def _install_hook() -> None:
     sys.meta_path.insert(0, _ClaudeCodeBypassFinder())
 
 
-try:
+def _load_billing_bypass():  # type: ignore[no-untyped-def]
+    try:
+        import anthropic_billing_bypass
+    except ImportError:
+        return None
+    return anthropic_billing_bypass
+
+
+def _patch_anthropic_adapter(module):  # type: ignore[no-untyped-def]
+    anthropic_billing_bypass = _load_billing_bypass()
+    if anthropic_billing_bypass is None:
+        return
+
+    ok = anthropic_billing_bypass.apply_patches(module)
+    if not ok:
+        sys.stderr.write(
+            "[hermes-claude-auth] bypass declined "
+            "(API incompatibility detected)\n"
+        )
+
+
+def _patch_error_classifier(_module):  # type: ignore[no-untyped-def]
+    anthropic_billing_bypass = _load_billing_bypass()
+    if anthropic_billing_bypass is None:
+        return
+
+    anthropic_billing_bypass._install_thinking_replay_classifier_patch()
+
+
+def _install_hook() -> None:
+    _make_import_hook(_TARGET_MODULE, _patch_anthropic_adapter, "hermes-claude-auth")
+
+
+def _install_all_hooks() -> None:
+    # error_classifier must be hooked before agent.conversation_loop binds
+    # classify_api_error, or thinking-replay 400s stay classified as fatal.
+    _make_import_hook(
+        "agent.error_classifier",
+        _patch_error_classifier,
+        "hermes-claude-auth-errors",
+    )
     _install_hook()
+
+
+try:
+    _install_all_hooks()
 except Exception as _exc:
     sys.stderr.write(f"[hermes-claude-auth] hook install failed: {_exc}\n")

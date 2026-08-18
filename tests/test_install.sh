@@ -66,6 +66,7 @@ unset HERMES_HOME
 
 mkdir -p "$FAKE_HOME/.hermes/hermes-agent"
 python3 -m venv "$FAKE_HOME/.hermes/hermes-agent/venv"
+mkdir -p "$FAKE_HOME/.hermes/hermes-agent/.git/hooks"
 
 VENV_PYTHON="$FAKE_HOME/.hermes/hermes-agent/venv/bin/python"
 SITE_PACKAGES="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
@@ -74,6 +75,7 @@ BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
 PTH_FILE="$SITE_PACKAGES/hermes_claude_auth.pth"
 BOOTSTRAP_FILE="$SITE_PACKAGES/_hermes_claude_auth_bootstrap.py"
 PATCH_FILE="$FAKE_HOME/.hermes/patches/anthropic_billing_bypass.py"
+POST_MERGE_HOOK="$FAKE_HOME/.hermes/hermes-agent/.git/hooks/post-merge"
 
 # Test 1: Fresh install
 T1="Test 1: Fresh install"

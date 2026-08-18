@@ -18,12 +18,11 @@ On 2026-04-04, Anthropic added server-side validation that rejects OAuth request
 
 ### Linux / macOS
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
-```
+# Remote install (one-liner)
+curl -fsSL https://raw.githubusercontent.com/Meapri/hermes-claude-auth/main/install-remote.sh | bash
 
-Or clone manually:
-```bash
-git clone https://github.com/kristianvast/hermes-claude-auth.git
+# Or clone manually
+git clone https://github.com/Meapri/hermes-claude-auth.git
 cd hermes-claude-auth
 ./install.sh
 ```
@@ -46,6 +45,46 @@ What the installer does:
 - Installs a `.pth` shim + bootstrap module into the hermes venv's site-packages (this loads the hook at interpreter startup; see "How it works" below for why a `.pth` and not `sitecustomize.py`)
 - Mirrors Claude Code credentials from the OS credential store to `~/.claude/.credentials.json` (macOS Keychain / Windows Credential Manager)
 - Restarts `hermes-gateway.service` if running (Linux only)
+
+## Agent Handoff Prompt
+
+Use this prompt when another Hermes instance needs to install, repair, or audit
+Claude auth without losing the Antigravity provider:
+
+```text
+You are setting up hermes-claude-auth on this machine.
+
+Work from the persistent clone at ~/hermes-claude-auth. If it exists and is
+clean, run `git pull`; if it has local changes, do not overwrite them and
+report that pull was skipped. If it does not exist, run:
+`git clone https://github.com/Meapri/hermes-claude-auth.git ~/hermes-claude-auth`
+
+Then run:
+`cd ~/hermes-claude-auth && ./install.sh`
+
+After install, verify and report:
+- `./install.sh --check` passes.
+- `~/.hermes/patches/anthropic_billing_bypass.py` matches this repo.
+- The Hermes venv `sitecustomize.py` contains `# hermes-claude-auth managed`.
+- If `# hermes-antigravity managed` is also present, confirm the shared hook
+  still contains Antigravity hooks for `hermes_cli.auth`,
+  `hermes_cli.providers`, `hermes_cli.commands`, `cli`,
+  `agent.auxiliary_client`, `hermes_cli.runtime_provider`,
+  `hermes_cli.main`, `hermes_cli.model_switch`, and `api.config`.
+- Importing `agent.error_classifier` in the Hermes venv does not print a
+  `ModuleNotFoundError` traceback for `anthropic_billing_bypass`.
+- `~/.hermes/hermes-agent/.git/hooks/post-merge` exists and is executable.
+
+If Claude credentials are available, smoke-test:
+`hermes chat --provider anthropic -m claude-sonnet-4-6 -q "OK" -Q`
+
+If Antigravity is also installed and credentials are available, smoke-test:
+`hermes chat --provider google-antigravity -m gemini-3.5-flash-high -q "OK" -Q`
+
+If any smoke test cannot be run, say exactly what blocked it. Finish with the
+current git commit, whether automatic repair is installed, and the check/smoke
+results.
+```
 
 ## Uninstall
 
@@ -178,6 +217,58 @@ upstream issue #6.
 | `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Removed if left behind by a legacy install (original restored from `.pre-hermes-claude-auth` backup when present) |
 | hermes-agent source files | NOT modified |
 
+## After Hermes Update
+
+When you run `hermes update` (which does `git pull` + `pip install`), the
+`sitecustomize.py` inside the venv may be overwritten. The patch file survives.
+
+**Automatic recovery (default).** `install.sh` installs a git `post-merge` hook
+into `~/.hermes/hermes-agent/.git/hooks/`, so the moment `hermes update` runs its
+`git pull`, the hook detects the missing hook and re-runs recovery automatically.
+If the Google Antigravity plugin is also installed, its coexistence
+`sitecustomize.py` (which already contains the Claude hook) is restored first and
+this installer leaves it untouched — the two patches never clobber each other.
+
+> **Keep the clone in a persistent path** (e.g. `~/hermes-claude-auth`), **not
+> `/tmp`**. The post-merge hook looks for the installer at
+> `$HOME/hermes-claude-auth/install.sh` first; a `/tmp` clone is wiped on reboot
+> and auto-recovery silently can't run.
+
+**Check what's broken** (verifies files exist AND match the repo byte-for-byte):
+```bash
+cd ~/hermes-claude-auth
+./install.sh --check
+```
+`--check` flags **content drift** too — if the installed
+`anthropic_billing_bypass.py` differs from the repo (e.g. a hot-fix was applied
+to one but not synced to the other), it reports `[!] DRIFT` so you can sync the
+newer copy back before a clean install silently reverts it. The shared
+`sitecustomize.py` is intentionally not compared (it legitimately differs when
+the Antigravity plugin's multi-hook version is installed).
+
+**Recover (only restores sitecustomize.py + patch):**
+```bash
+cd ~/hermes-claude-auth
+git pull && ./install.sh --post-update
+```
+
+**Full recovery:**
+```bash
+cd ~/hermes-claude-auth
+git pull && ./install.sh
+```
+
+### What survives `hermes update`
+
+| File | Location | Survives? |
+|------|----------|:---:|
+| `anthropic_billing_bypass.py` | `~/.hermes/patches/` | ✅ Outside repo |
+| **`sitecustomize.py`** | venv `site-packages/` | ❌ Overwritten |
+| Claude credentials | `~/.claude/` | ✅ Managed by Claude CLI |
+| Auth token | `~/.hermes/auth.json` | ✅ Outside repo |
+
+Only `sitecustomize.py` needs recovery. `--post-update` does exactly that.
+
 ## Compatibility
 - Tested with hermes-agent on Python 3.11+
 - Linux, macOS, and **Windows** (native: `%LOCALAPPDATA%\hermes`; the bypass
@@ -214,28 +305,40 @@ billing pay-per-token:
 > This replaces the static pin from upstream PR #21 and removes the drift that
 > triggered issue #6.
 
-## Known limitations (upstream PRs not yet ported)
+## Integrated community PRs
 
-This fork intentionally does **not** include some open upstream PRs. Status:
+This build merges the open community PRs into one coherent tree. Where two PRs
+solved the same problem differently, the newer/better-reasoned design won and
+the other was folded in or dropped:
 
-- **PR #23** (thinking replay / tool repair hardening, +1296): fixes HTTP 400 on
-  mutated `thinking` / `redacted_thinking` blocks in long Opus conversations.
-  Not ported — large diff against our `v1.5.1+rl-autodetect` base and our
-  bypass already strips `thinking['effort']` + temperature. If you hit HTTP 400
-  with `thinking` blocks, port `_strip_thinking_from_replay` from #23.
-- **PR #24** (full Windows + Credential Manager mirroring, +437): not ported —
-  conflicts with our profile-aware loader (Fix A) and our two-layer auto-recovery
-  already covers Windows installs + venv rebuilds. Only the `.ps1` installers
-  would be additive; not needed since `core.hooksPath` + cron handle it.
-- **PR #15 / #10** (wire-format 2.1.117 / 2.1.123): not ported — our dynamic
-  version detection already advertises whatever Claude Code is actually
-  installed, so we're never behind the wire format.
-- **PR #20** (per-pool `account_uuid`): only relevant for multi-account Claude
-  credential pools; single-account setups don't need it.
-- **PR #16** (.pth shim for Debian/Ubuntu apport): only relevant on Debian/Ubuntu
-  where a system `sitecustomize.py` wins import priority; Windows/macOS unaffected.
+- **PR #16** — loader moved from `sitecustomize.py` to a `.pth` shim +
+  bootstrap module, fixing installs that were silently dead on Debian/Ubuntu
+  (the system apport `sitecustomize.py` wins import priority).
+- **PR #28** — patch resolution across Hermes profiles, `%LOCALAPPDATA%`, and
+  `$HERMES_HOME`, plus dynamic Claude Code version detection and the two-layer
+  auto-recovery (`core.hooksPath` hooks + `restore_loader.sh` cron).
+- **PR #26** — `$HERMES_HOME` honoured throughout the shell installers.
+- **PR #24** — Windows PowerShell installers + Credential Manager mirroring,
+  retargeted onto the `.pth` mechanism. Supersedes PR #17.
+- **PR #21** — fingerprint parity (forced `user-agent`, `x-app`). Its
+  multi-interpreter install was ported onto the `.pth` mechanism so the hook
+  also lands in an editable install used by the CLI.
+- **PR #23** — thinking-block replay integrity, tool-pair repair hardening, and
+  the `agent.error_classifier` hook. Its installer rewrite (`--check`,
+  `.git/hooks/post-merge`) was dropped in favour of PR #28's recovery model,
+  which deliberately avoids `.git/hooks` because `hermes update` stashes it.
+- **PR #20** — per-pool-entry `account_uuid` billing routing for multi-account
+  credential pools.
+- **PR #1** — clone URL fix.
 
+Not merged:
 
+- **PR #17** — strict subset of PR #24.
+- **PR #7** — MD5 tool-name obfuscation. Upstream never adopted it and still
+  ships PascalCase `mcp_Bash`; this tree keeps the namespaced PascalCase scheme.
+- **PR #10** — stale fingerprint base (branched before v1.5.0) and conflicting.
+
+## Troubleshooting
 
 ### Install issues
 - **"hermes-agent not found"**: Make sure Hermes is installed at `$HERMES_HOME/hermes-agent/` (defaults to `~/.hermes/hermes-agent/`) or `%LOCALAPPDATA%\hermes\hermes-agent\` (Windows)

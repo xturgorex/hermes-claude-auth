@@ -14,6 +14,19 @@ MARKER="# hermes-claude-auth managed"
 BOOTSTRAP_NAME="_hermes_claude_auth_bootstrap.py"
 PTH_NAME="hermes_claude_auth.pth"
 
+# ── Parse flags ─────────────────────────────────────────────────────
+POST_UPDATE=false
+CHECK_ONLY=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --post-update) POST_UPDATE=true ;;
+        --check)       CHECK_ONLY=true ;;
+        *) ;;
+    esac
+done
+
+# ── Pre-flight checks ───────────────────────────────────────────────
 if [ ! -d "$HERMES_AGENT_DIR" ]; then
     printf "${RED}[✗] hermes-agent not found at %s${RESET}\n" "$HERMES_AGENT_DIR"
     printf "    Install hermes-agent first: https://github.com/nousresearch/hermes-agent\n"
@@ -44,6 +57,72 @@ if [ ! -d "$SITE_PACKAGES" ]; then
     exit 1
 fi
 
+SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+
+# ── --check mode: verify patch integrity ────────────────────────────
+if $CHECK_ONLY; then
+    ALL_OK=true
+    for f in "$PATCHES_DIR/anthropic_billing_bypass.py"; do
+        if [[ -f "$f" ]]; then
+            printf "${GREEN}[✓] %s${RESET}\n" "$f"
+        else
+            printf "${RED}[✗] MISSING: %s${RESET}\n" "$f"
+            ALL_OK=false
+        fi
+    done
+
+    if [[ -f "$SITECUSTOMIZE" ]] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
+        printf "${GREEN}[✓] sitecustomize hook present${RESET}\n"
+    else
+        printf "${RED}[✗] sitecustomize hook MISSING or outdated${RESET}\n"
+        ALL_OK=false
+    fi
+
+    POST_MERGE_HOOK="$HERMES_AGENT_DIR/.git/hooks/post-merge"
+    if [[ -f "$POST_MERGE_HOOK" && -x "$POST_MERGE_HOOK" ]] \
+        && grep -q "Recovering Claude Code bypass" "$POST_MERGE_HOOK" 2>/dev/null; then
+        printf "${GREEN}[✓] auto-recovery hook present${RESET}\n"
+    elif [[ -d "$HERMES_AGENT_DIR/.git/hooks" ]]; then
+        printf "${RED}[✗] auto-recovery hook MISSING, stale, or not executable${RESET}\n"
+        ALL_OK=false
+    else
+        printf "${YELLOW}[!] hermes-agent git hooks directory not found; auto-recovery hook not checked${RESET}\n"
+    fi
+
+    # ── Content drift check: installed patch must match this repo ───────
+    # File-existence alone does not catch the case where a runtime hotfix
+    # was applied to the installed copy but never synced back to the repo
+    # (or vice-versa). Compare byte-for-byte and warn on any drift.
+    # NOTE: sitecustomize.py is intentionally NOT compared — it is shared
+    # with other provider patches (e.g. Antigravity) and legitimately
+    # diverges from this repo's single-provider hook.
+    INSTALLED_PATCH="$PATCHES_DIR/anthropic_billing_bypass.py"
+    REPO_PATCH="$SCRIPT_DIR/anthropic_billing_bypass.py"
+    if [[ -f "$INSTALLED_PATCH" && -f "$REPO_PATCH" ]]; then
+        if ! cmp -s "$INSTALLED_PATCH" "$REPO_PATCH"; then
+            printf "${YELLOW}[!] DRIFT: anthropic_billing_bypass.py differs from repo (%s)${RESET}\n" "$REPO_PATCH"
+            ALL_OK=false
+        fi
+    fi
+
+    if $ALL_OK; then
+        printf "\n${GREEN}Claude Code bypass patches intact.${RESET}\n"
+        exit 0
+    else
+        printf "\n${YELLOW}Patches missing or drifted. To restore from repo: ./install.sh${RESET}\n"
+        printf "${YELLOW}If the installed copy is the newer one, sync it back to the repo and commit instead.${RESET}\n"
+        exit 1
+    fi
+fi
+
+# ── Full install or post-update recovery ────────────────────────────
+if $POST_UPDATE; then
+    printf "${YELLOW}[post-update] Restoring Claude Code bypass after hermes update...${RESET}\n"
+else
+    printf "${YELLOW}[install] Installing Claude Code OAuth bypass...${RESET}\n"
+fi
+
+# ── Copy patch ──────────────────────────────────────────────────────
 mkdir -p "$PATCHES_DIR"
 cp "$SCRIPT_DIR/anthropic_billing_bypass.py" "$PATCHES_DIR/anthropic_billing_bypass.py"
 chmod 644 "$PATCHES_DIR/anthropic_billing_bypass.py"
@@ -141,10 +220,38 @@ do
     fi
 done
 
-# macOS: hermes-agent reads Claude subscription credentials from
-# ~/.claude/.credentials.json, but Claude Code on macOS stores them in
-# Keychain only.  Mirror the Keychain entry into the file so auth works
-# out of the box.  No-op on Linux (Claude Code writes the file directly).
+# ── Verify patch ────────────────────────────────────────────────────
+PATCH_CHECK=$("$VENV_PYTHON" -c "
+import sys, os
+sys.path.insert(0, os.path.expanduser('$PATCHES_DIR'))
+try:
+    import anthropic_billing_bypass
+    v = getattr(anthropic_billing_bypass, '__version__', 'unknown')
+    print(f'OK (v{v})')
+except Exception as e:
+    print(f'FAIL ({e})')
+" 2>/dev/null || echo "FAIL (import error)")
+printf "${GREEN}[✓] Patch integrity: %s${RESET}\n" "$PATCH_CHECK"
+
+# ── Install auto-recovery git hook ──────────────────────────────────
+GIT_HOOKS_DIR="$HERMES_AGENT_DIR/.git/hooks"
+POST_MERGE_HOOK="$GIT_HOOKS_DIR/post-merge"
+ANTIGRAVITY_HOOK="$SCRIPT_DIR/../hermes-google-antigravity-plugin/scripts/post-merge-hook.sh"
+# Try sibling repo first, then look for standalone hook
+if [ -f "$ANTIGRAVITY_HOOK" ]; then
+    HOOK_SRC="$ANTIGRAVITY_HOOK"
+elif [ -f "$SCRIPT_DIR/post-merge-hook.sh" ]; then
+    HOOK_SRC="$SCRIPT_DIR/post-merge-hook.sh"
+else
+    HOOK_SRC=""
+fi
+if [ -d "$GIT_HOOKS_DIR" ] && [ -n "$HOOK_SRC" ] && [ -f "$HOOK_SRC" ]; then
+    cp "$HOOK_SRC" "$POST_MERGE_HOOK"
+    chmod +x "$POST_MERGE_HOOK"
+    printf "${GREEN}[✓] Installed auto-recovery hook (post-merge)${RESET}\n"
+fi
+
+# ── macOS Keychain mirror ───────────────────────────────────────────
 if [ "$(uname -s)" = "Darwin" ]; then
     CRED_FILE="$HOME/.claude/.credentials.json"
     if KEYCHAIN_CRED="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)"; then
@@ -162,6 +269,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
 fi
 
+# ── Restart gateway ─────────────────────────────────────────────────
 if systemctl --user is-active hermes-gateway.service >/dev/null 2>&1; then
     systemctl --user restart hermes-gateway.service
     printf "${GREEN}[✓] Restarted hermes-gateway.service${RESET}\n"

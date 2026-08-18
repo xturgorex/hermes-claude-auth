@@ -14,7 +14,9 @@ from anthropic_billing_bypass import (
     _model_disables_effort,
     _pascalcase_mcp_name,
     _repair_tool_pairs,
+    _split_tool_results_from_followup_user_text,
     _strip_effort,
+    _strip_thinking_from_replay,
     _unwrap_tool_name,
     _wrap_tool_name,
     apply_claude_code_bypass,
@@ -213,6 +215,112 @@ def test_apply_claude_code_bypass_rewrites_tool_names_to_hermes_namespace(
     assert tool_use_block["name"] == "mcp__hermes__Bash"
 
 
+def test_apply_claude_code_bypass_rewraps_tool_use_in_thinking_message():
+    """v1.5.7: signed thinking blocks are PRESERVED (original block order
+    maintained via _anthropic_raw_content fast path).  tool_use names are
+    still re-wrapped to mcp__hermes__ form."""
+    thinking_block = {"type": "thinking", "thinking": "private", "signature": "sig"}
+    api_kwargs = {
+        "system": "plain",
+        "model": "claude-opus-4-8",
+        "tools": [{"name": "terminal"}],
+        "messages": [
+            {"role": "user", "content": "please use a tool"},
+            {
+                "role": "assistant",
+                "content": [
+                    thinking_block,
+                    {"type": "tool_use", "id": "tool_1", "name": "terminal", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool_1", "content": "ok"},
+                ],
+            },
+        ],
+    }
+
+    apply_claude_code_bypass(api_kwargs, "2.1.112")
+
+    assistant_content = api_kwargs["messages"][1]["content"]
+    # Signed thinking block should be PRESERVED (v1.5.7 — order-preserving)
+    thinking_blocks = [
+        b for b in assistant_content
+        if isinstance(b, dict) and b.get("type") == "thinking"
+    ]
+    assert len(thinking_blocks) == 1
+    assert thinking_blocks[0]["signature"] == "sig"
+    # tool_use name should still be re-wrapped
+    tool_use_blocks = [b for b in assistant_content if isinstance(b, dict) and b.get("type") == "tool_use"]
+    assert len(tool_use_blocks) == 1
+    assert tool_use_blocks[0]["name"] == "mcp__hermes__Terminal"
+
+
+def test_split_tool_results_from_followup_user_text_inserts_bridge():
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig"},
+                {"type": "tool_use", "id": "tool_1", "name": "terminal", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tool_1", "content": "ok"},
+                {"type": "text", "text": "new prompt after failed tool turn"},
+            ],
+        },
+    ]
+
+    repaired = _split_tool_results_from_followup_user_text(messages)
+
+    assert repaired is not messages
+    assert [msg["role"] for msg in repaired] == ["assistant", "user", "assistant", "user"]
+    assert repaired[1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "tool_1", "content": "ok"}
+    ]
+    assert repaired[2]["content"][0]["type"] == "text"
+    assert repaired[3]["content"] == [
+        {"type": "text", "text": "new prompt after failed tool turn"}
+    ]
+
+
+def test_apply_claude_code_bypass_splits_merged_tool_result_and_followup_text():
+    api_kwargs = {
+        "system": "plain",
+        "model": "claude-opus-4-8",
+        "messages": [
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "private", "signature": "sig"},
+                    {"type": "tool_use", "id": "tool_1", "name": "terminal", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool_1", "content": "ok"},
+                    {"type": "text", "text": "new prompt"},
+                ],
+            },
+        ],
+    }
+
+    apply_claude_code_bypass(api_kwargs, "2.1.112")
+
+    roles = [msg["role"] for msg in api_kwargs["messages"]]
+    assert roles == ["user", "assistant", "user", "assistant", "user"]
+    assert api_kwargs["messages"][2]["content"][0]["type"] == "tool_result"
+    assert api_kwargs["messages"][3]["content"][0]["type"] == "text"
+    assert api_kwargs["messages"][4]["content"][0]["text"] == "new prompt"
+
+
 def test_apply_claude_code_bypass_injects_stainless_and_direct_browser_headers(
     basic_api_kwargs,
 ):
@@ -312,6 +420,50 @@ def test_repair_tool_pairs_returns_input_when_nothing_to_repair():
     assert repaired is messages  # identity-preserving no-op
 
 
+def test_repair_tool_pairs_counts_tool_use_inside_thinking_message():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig"},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+        },
+    ]
+
+    repaired = _repair_tool_pairs(messages)
+
+    assert repaired is messages
+
+
+def test_repair_tool_pairs_synthesizes_result_for_orphaned_thinking_tool_use():
+    thinking_block = {"type": "thinking", "thinking": "private", "signature": "sig"}
+    tool_use_block = {"type": "tool_use", "id": "t_missing", "name": "bash", "input": {}}
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [thinking_block, tool_use_block]},
+        {"role": "user", "content": [{"type": "text", "text": "next request"}]},
+    ]
+
+    repaired = _repair_tool_pairs(messages)
+
+    assert repaired[1]["content"] is messages[1]["content"]
+    assert repaired[1]["content"] == [thinking_block, tool_use_block]
+    next_user_blocks = repaired[2]["content"]
+    assert next_user_blocks[0] == {
+        "type": "tool_result",
+        "tool_use_id": "t_missing",
+        "content": "[Hermes repair: missing tool result synthesized for an earlier tool_use.]",
+        "is_error": True,
+    }
+    assert next_user_blocks[1] == {"type": "text", "text": "next request"}
+
+
 def test_apply_claude_code_bypass_repairs_tool_pairs_before_signing(simple_messages):
     api_kwargs = {
         "system": "p",
@@ -332,6 +484,152 @@ def test_apply_claude_code_bypass_repairs_tool_pairs_before_signing(simple_messa
     # Orphan removed; assistant message dropped (now empty after filter).
     assert len(api_kwargs["messages"]) == 1
     assert api_kwargs["messages"][0]["role"] == "user"
+
+
+def test_many_paired_tool_calls_survive_bypass_and_are_namespaced():
+    tool_count = 100
+    assistant_blocks = [
+        {
+            "type": "tool_use",
+            "id": f"tool_{idx}",
+            "name": "mcp_bash" if idx % 2 == 0 else "terminal",
+            "input": {"cmd": f"printf {idx}"},
+        }
+        for idx in range(tool_count)
+    ]
+    result_blocks = [
+        {
+            "type": "tool_result",
+            "tool_use_id": f"tool_{idx}",
+            "content": f"ok {idx}",
+        }
+        for idx in range(tool_count)
+    ]
+    api_kwargs = {
+        "system": "plain",
+        "model": "claude-opus-4-6-20260101",
+        "tools": [{"name": "mcp_bash"}, {"name": "terminal"}],
+        "messages": [
+            {"role": "user", "content": "run many tools"},
+            {"role": "assistant", "content": assistant_blocks},
+            {"role": "user", "content": result_blocks},
+        ],
+    }
+
+    apply_claude_code_bypass(api_kwargs, "2.1.112")
+
+    assistant_after = api_kwargs["messages"][1]["content"]
+    result_after = api_kwargs["messages"][2]["content"]
+    assert len(assistant_after) == tool_count
+    assert len(result_after) == tool_count
+    assert {block["id"] for block in assistant_after} == {
+        block["tool_use_id"] for block in result_after
+    }
+    assert all(
+        block["name"].startswith(_MCP_HERMES_NAMESPACE)
+        for block in assistant_after
+    )
+
+
+def test_large_orphaned_tool_history_is_repaired_without_leftover_orphans():
+    messages = [{"role": "user", "content": [{"type": "text", "text": "start"}]}]
+    expected_ids = set()
+    for turn in range(20):
+        valid_id = f"valid_{turn}"
+        missing_id = f"missing_{turn}"
+        expected_ids.add(valid_id)
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": valid_id, "name": "bash", "input": {}},
+                    {"type": "tool_use", "id": missing_id, "name": "read", "input": {}},
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": valid_id, "content": "ok"},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"stale_{turn}",
+                        "content": "stale",
+                    },
+                ],
+            }
+        )
+
+    repaired = _repair_tool_pairs(messages)
+    seen_uses = {
+        block["id"]
+        for msg in repaired
+        for block in msg.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_use"
+    }
+    seen_results = {
+        block["tool_use_id"]
+        for msg in repaired
+        for block in msg.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    }
+
+    assert seen_uses == expected_ids
+    assert seen_results == expected_ids
+
+
+def test_many_thinking_orphaned_tool_uses_get_synthetic_results():
+    messages = [{"role": "user", "content": [{"type": "text", "text": "start"}]}]
+    original_assistant_contents = []
+    for turn in range(25):
+        content = [
+            {
+                "type": "thinking",
+                "thinking": f"private {turn}",
+                "signature": f"sig_{turn}",
+            },
+            {
+                "type": "tool_use",
+                "id": f"thinking_tool_{turn}",
+                "name": "terminal",
+                "input": {},
+            },
+        ]
+        original_assistant_contents.append(content)
+        messages.append({"role": "assistant", "content": content})
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": f"next {turn}"}],
+            }
+        )
+
+    repaired = _repair_tool_pairs(messages)
+
+    synthetic_results = []
+    preserved_contents = []
+    for msg in repaired:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        if msg.get("role") == "assistant" and any(
+            isinstance(block, dict) and block.get("type") == "thinking"
+            for block in content
+        ):
+            preserved_contents.append(content)
+        synthetic_results.extend(
+            block
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "tool_result"
+            and block.get("is_error") is True
+        )
+
+    assert preserved_contents == original_assistant_contents
+    assert {block["tool_use_id"] for block in synthetic_results} == {
+        f"thinking_tool_{turn}" for turn in range(25)
+    }
 
 
 def test_model_disables_effort_for_haiku():
@@ -543,3 +841,100 @@ def test_bypass_skips_context_management_without_thinking(basic_api_kwargs):
 
     extra_body = basic_api_kwargs.get("extra_body", {})
     assert "context_management" not in extra_body
+# ── _strip_thinking_from_replay tests (v1.5.6) ──────────────────────────────
+
+
+def test_strip_thinking_from_replay_removes_unsigned_thinking_blocks():
+    """Strip unsigned thinking blocks (legacy messages without raw content
+    preservation) but preserve signed ones (from _anthropic_raw_content
+    fast path with valid block order)."""
+    messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": [
+                # Unsigned thinking — should be stripped (legacy slow path)
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "response"},
+            ],
+        },
+        {"role": "user", "content": "next"},
+        {
+            "role": "assistant",
+            "content": [
+                # Signed thinking — should be preserved (fast path, valid order)
+                {"type": "thinking", "thinking": "private", "signature": "sig1"},
+                {"type": "text", "text": "second response"},
+            ],
+        },
+    ]
+
+    _strip_thinking_from_replay(messages)
+
+    # First assistant (unsigned): thinking stripped
+    assert not any(
+        b.get("type") == "thinking" for b in messages[1]["content"]
+    )
+    # Second assistant (signed): thinking preserved
+    assert any(
+        b.get("type") == "thinking" and b.get("signature") == "sig1"
+        for b in messages[3]["content"]
+    )
+
+
+def test_strip_thinking_from_replay_unsigned_thinking_only_message():
+    """Edge case: when ALL content blocks are unsigned thinking, a placeholder
+    text block must replace them to avoid empty content (Anthropic rejects it)."""
+    messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": [
+                # No signature → unsigned (legacy), should be stripped
+                {"type": "thinking", "thinking": "private"},
+            ],
+        },
+    ]
+
+    _strip_thinking_from_replay(messages)
+
+    assistant = messages[1]
+    assert len(assistant["content"]) == 1
+    assert assistant["content"][0]["type"] == "text"
+    assert assistant["content"][0]["text"] == "(thinking elided)"
+
+
+def test_strip_thinking_from_replay_signed_thinking_preserved():
+    """Signed thinking blocks should be preserved (order is correct from
+    _anthropic_raw_content fast path)."""
+    messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig"},
+                {"type": "tool_use", "id": "t1", "name": "terminal", "input": {}},
+            ],
+        },
+    ]
+
+    _strip_thinking_from_replay(messages)
+
+    # Signed thinking preserved
+    assistant = messages[1]
+    assert len(assistant["content"]) == 2
+    assert assistant["content"][0]["type"] == "thinking"
+    assert assistant["content"][0]["signature"] == "sig"
+
+
+def test_strip_thinking_from_replay_leaves_non_assistant():
+    """User and tool messages should be untouched."""
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "tool", "content": "result"},
+    ]
+    original = copy.deepcopy(messages)
+
+    _strip_thinking_from_replay(messages)
+
+    assert messages == original

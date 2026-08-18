@@ -99,3 +99,21 @@ def test_finder_sets_patched_flag_and_stops_repatching(hook_module, monkeypatch)
     assert finder._patched is True
     assert applied == [hook_module._TARGET_MODULE]
     assert finder.find_spec(hook_module._TARGET_MODULE) is None
+
+
+def test_patchers_noop_when_bypass_module_is_absent(hook_module, monkeypatch, capsys):
+    monkeypatch.delitem(sys.modules, "anthropic_billing_bypass", raising=False)
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "anthropic_billing_bypass":
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    hook_module._patch_anthropic_adapter(types.ModuleType("agent.anthropic_adapter"))
+    hook_module._patch_error_classifier(types.ModuleType("agent.error_classifier"))
+
+    captured = capsys.readouterr()
+    assert captured.err == ""

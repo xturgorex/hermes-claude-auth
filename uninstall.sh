@@ -107,9 +107,12 @@ if [ "$PURGE" -eq 1 ]; then
     removed_patch=1
   fi
 
-  # Drop the pycache directory if it's still around
+  # install.sh imports the patch during verification, which can leave a
+  # Python bytecode cache behind.  Purge only this plugin's cache files so
+  # other providers sharing ~/.hermes/patches are not disturbed.
   if [ -d "$PATCH_DIR/__pycache__" ]; then
-    rm -rf "$PATCH_DIR/__pycache__" 2>/dev/null || true
+    rm -f "$PATCH_DIR"/__pycache__/anthropic_billing_bypass.*.pyc
+    rmdir "$PATCH_DIR/__pycache__" 2>/dev/null || true
   fi
 
   if [ -d "$PATCH_DIR" ]; then
@@ -122,6 +125,13 @@ if [ "$PURGE" -eq 1 ]; then
     if [ "$empty" -eq 1 ]; then
       rmdir "$PATCH_DIR" 2>/dev/null || true
     fi
+  fi
+
+  # Remove auto-recovery git hook
+  HOOK_FILE="$HOME/.hermes/hermes-agent/.git/hooks/post-merge"
+  if [ -f "$HOOK_FILE" ] && grep -q "hermes-post-update" "$HOOK_FILE" 2>/dev/null; then
+    rm -f "$HOOK_FILE"
+    printf '%b[✓]%b Removed auto-recovery hook (post-merge)\n' "$GREEN" "$RESET"
   fi
 fi
 
