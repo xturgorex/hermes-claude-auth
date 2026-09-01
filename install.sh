@@ -71,8 +71,11 @@ if $CHECK_ONLY; then
         fi
     done
 
-    if [[ -f "$SITECUSTOMIZE" ]] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
-        printf "${GREEN}[✓] sitecustomize hook present${RESET}\n"
+    if [[ -f "$SITE_PACKAGES/$PTH_NAME" ]] \
+        && grep -q "import _hermes_claude_auth_bootstrap" "$SITE_PACKAGES/$PTH_NAME" \
+        && [[ -f "$SITE_PACKAGES/$BOOTSTRAP_NAME" ]] \
+        && grep -q "$MARKER" "$SITE_PACKAGES/$BOOTSTRAP_NAME"; then
+        printf "${GREEN}[✓] .pth/bootstrap hook present${RESET}\n"
     else
         printf "${RED}[✗] sitecustomize hook MISSING or outdated${RESET}\n"
         ALL_OK=false
@@ -83,8 +86,7 @@ if $CHECK_ONLY; then
         && grep -q "Recovering Claude Code bypass" "$POST_MERGE_HOOK" 2>/dev/null; then
         printf "${GREEN}[✓] auto-recovery hook present${RESET}\n"
     elif [[ -d "$HERMES_AGENT_DIR/.git/hooks" ]]; then
-        printf "${RED}[✗] auto-recovery hook MISSING, stale, or not executable${RESET}\n"
-        ALL_OK=false
+        printf "${YELLOW}[!] auto-recovery hook not installed (optional)${RESET}\n"
     else
         printf "${YELLOW}[!] hermes-agent git hooks directory not found; auto-recovery hook not checked${RESET}\n"
     fi
@@ -242,6 +244,8 @@ if [ -f "$ANTIGRAVITY_HOOK" ]; then
     HOOK_SRC="$ANTIGRAVITY_HOOK"
 elif [ -f "$SCRIPT_DIR/post-merge-hook.sh" ]; then
     HOOK_SRC="$SCRIPT_DIR/post-merge-hook.sh"
+elif [ -f "$SCRIPT_DIR/post-merge.hook.sh" ]; then
+    HOOK_SRC="$SCRIPT_DIR/post-merge.hook.sh"
 else
     HOOK_SRC=""
 fi
