@@ -54,19 +54,22 @@ Claude auth without losing the Antigravity provider:
 ```text
 You are setting up hermes-claude-auth on this machine.
 
-Work from the persistent clone at ~/hermes-claude-auth. If it exists and is
-clean, run `git pull`; if it has local changes, do not overwrite them and
-report that pull was skipped. If it does not exist, run:
-`git clone https://github.com/kristianvast/hermes-claude-auth.git ~/hermes-claude-auth`
+Work from the persistent clone at ~/.hermes/patches/hermes-claude-auth. If it
+exists and is clean, run `git pull`; if it has local changes, do not overwrite
+them and report that pull was skipped. If it does not exist, run:
+`git clone https://github.com/kristianvast/hermes-claude-auth.git ~/.hermes/patches/hermes-claude-auth`
 
 Then run:
-`cd ~/hermes-claude-auth && ./install.sh`
+`cd ~/.hermes/patches/hermes-claude-auth && ./install.sh`
 
 After install, verify and report:
 - `./install.sh --check` passes.
 - `~/.hermes/patches/anthropic_billing_bypass.py` matches this repo.
-- The Hermes venv `sitecustomize.py` contains `# hermes-claude-auth managed`.
-- If `# hermes-antigravity managed` is also present, confirm the shared hook
+- The Hermes venv's site-packages contains `hermes_claude_auth.pth` (whose body
+  is `import _hermes_claude_auth_bootstrap`) and `_hermes_claude_auth_bootstrap.py`
+  carrying the `# hermes-claude-auth managed` marker.
+- If a `sitecustomize.py` carrying `# hermes-antigravity managed` is also
+  present, leave it in place and confirm the shared hook
   still contains Antigravity hooks for `hermes_cli.auth`,
   `hermes_cli.providers`, `hermes_cli.commands`, `cli`,
   `agent.auxiliary_client`, `hermes_cli.runtime_provider`,
@@ -110,30 +113,50 @@ ways:
    **stashed** by the update's `git stash` step, so hooks there don't fire at
    the right time.
 2. **Venv rebuild** — the update provisions a fresh Python runtime, which
-   deletes `sitecustomize.py` outright. No git hook covers this.
+   deletes `hermes_claude_auth.pth` and `_hermes_claude_auth_bootstrap.py`
+   outright. No git hook covers this.
+
+Both recovery scripts below simply re-run `install.sh --post-update`, which
+reinstalls the `.pth` shim + bootstrap module idempotently. They resolve the
+Hermes data root from `$HERMES_HOME` (walking up out of a `profiles/<name>`
+dir), then `%LOCALAPPDATA%\hermes`, then `~/.hermes`.
 
 ### Two-layer defense
 
 **Layer 1 — git hooks via `core.hooksPath` (outside the repo):**
 
 ```bash
-# From inside your hermes-agent checkout:
-mkdir -p "$LOCALAPPDATA/hermes/git-hooks"
-cp post-merge.hook.sh "$LOCALAPPDATA/hermes/git-hooks/post-merge"
-cp post-checkout.hook.sh "$LOCALAPPDATA/hermes/git-hooks/post-checkout"
-chmod +x "$LOCALAPPDATA/hermes/git-hooks/post-"*
-git config core.hooksPath "$LOCALAPPDATA/hermes/git-hooks"
+# Linux / macOS — from inside your hermes-claude-auth clone:
+HOOKS_DIR="$HOME/.hermes/git-hooks"
+mkdir -p "$HOOKS_DIR"
+cp post-merge.hook.sh    "$HOOKS_DIR/post-merge"
+cp post-checkout.hook.sh "$HOOKS_DIR/post-checkout"
+chmod +x "$HOOKS_DIR/post-"*
+git -C "$HOME/.hermes/hermes-agent" config core.hooksPath "$HOOKS_DIR"
+```
+
+```powershell
+# Windows (PowerShell)
+$HooksDir = "$env:LOCALAPPDATA\hermes\git-hooks"
+New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
+Copy-Item post-merge.hook.sh    "$HooksDir\post-merge"
+Copy-Item post-checkout.hook.sh "$HooksDir\post-checkout"
+git -C "$env:LOCALAPPDATA\hermes\hermes-agent" config core.hooksPath $HooksDir
 ```
 
 Because the hooks live *outside* `.git/hooks/`, the update's `git stash`
 can't touch them, and `core.hooksPath` makes git use them for every
 merge/checkout.
 
+> `install.sh` also drops a copy of the post-merge hook into
+> `~/.hermes/hermes-agent/.git/hooks/post-merge` as a best-effort fallback.
+> Setting `core.hooksPath` above is the more reliable path.
+
 **Layer 2 — watchdog cron (covers venv rebuild):**
 
 ```bash
-# Hermes cron runs restore_loader.sh every 15m; it re-copies the loader
-# from $LOCALAPPDATA/hermes/patches/sitecustomize.py if it's missing.
+# Hermes cron runs restore_loader.sh every 15m. It checks whether the
+# .pth/bootstrap pair is still intact and only reinstalls when it isn't.
 hermes cron create "every 15m" --name restore-claude-auth-loader \
   --no-agent --script restore_loader.sh --deliver local
 ```
@@ -141,8 +164,14 @@ hermes cron create "every 15m" --name restore-claude-auth-loader \
 The cron job only fires while the Hermes gateway is running — after an update,
 the loader is restored within ≤15 minutes of the gateway coming back up.
 
-Both layers are idempotent and never break the update. The canonical loader
-lives at `$LOCALAPPDATA/hermes/patches/sitecustomize.py` (outside any repo).
+Both layers are idempotent and never break the update. The canonical patch and
+this clone live outside any managed repo, at
+`$HERMES_HOME/patches/anthropic_billing_bypass.py` and
+`$HERMES_HOME/patches/hermes-claude-auth/`.
+
+> **Keep the clone in a persistent path** — the recovery scripts invoke
+> `$HERMES_HOME/patches/hermes-claude-auth/install.sh`. A `/tmp` clone is wiped
+> on reboot and auto-recovery silently can't run.
 
 > **Windows note:** hooks are POSIX shell scripts run under Git Bash (ships
 > with Git for Windows). The cron script uses `uname` to resolve paths and
@@ -221,54 +250,64 @@ upstream issue #6.
 ## After Hermes Update
 
 When you run `hermes update` (which does `git pull` + `pip install`), the
-`sitecustomize.py` inside the venv may be overwritten. The patch file survives.
+`.pth` shim and bootstrap module inside the venv may be removed. The patch file
+in `$HERMES_HOME/patches/` survives.
 
 **Automatic recovery (default).** `install.sh` installs a git `post-merge` hook
-into `~/.hermes/hermes-agent/.git/hooks/`, so the moment `hermes update` runs its
-`git pull`, the hook detects the missing hook and re-runs recovery automatically.
+into `~/.hermes/hermes-agent/.git/hooks/`, so when `hermes update` runs its
+`git pull`, the hook re-runs `install.sh --post-update` and restores the hook
+automatically. For the more robust setup that also survives the update's
+`git stash` and a venv rebuild, see "Surviving `hermes update`" above.
 If the Google Antigravity plugin is also installed, its coexistence
-`sitecustomize.py` (which already contains the Claude hook) is restored first and
-this installer leaves it untouched — the two patches never clobber each other.
+`sitecustomize.py` is left untouched — the `.pth` shim loads independently, so
+the two patches never clobber each other.
 
-> **Keep the clone in a persistent path** (e.g. `~/hermes-claude-auth`), **not
-> `/tmp`**. The post-merge hook looks for the installer at
-> `$HOME/hermes-claude-auth/install.sh` first; a `/tmp` clone is wiped on reboot
-> and auto-recovery silently can't run.
+> **Keep the clone in a persistent path** (e.g.
+> `~/.hermes/patches/hermes-claude-auth`), **not `/tmp`**. The recovery scripts
+> invoke `$HERMES_HOME/patches/hermes-claude-auth/install.sh`; a `/tmp` clone is
+> wiped on reboot and auto-recovery silently can't run.
 
 **Check what's broken** (verifies files exist AND match the repo byte-for-byte):
 ```bash
-cd ~/hermes-claude-auth
+cd ~/.hermes/patches/hermes-claude-auth
 ./install.sh --check
 ```
-`--check` flags **content drift** too — if the installed
-`anthropic_billing_bypass.py` differs from the repo (e.g. a hot-fix was applied
-to one but not synced to the other), it reports `[!] DRIFT` so you can sync the
-newer copy back before a clean install silently reverts it. The shared
-`sitecustomize.py` is intentionally not compared (it legitimately differs when
-the Antigravity plugin's multi-hook version is installed).
+`--check` verifies the patch file, the `.pth`/bootstrap pair (via the
+`# hermes-claude-auth managed` marker), and the auto-recovery hook (via the
+`HERMES-CLAUDE-AUTH-HOOK` marker). It also flags **content drift** — if the
+installed `anthropic_billing_bypass.py` differs from the repo (e.g. a hot-fix
+was applied to one but not synced to the other), it reports `[!] DRIFT` so you
+can sync the newer copy back before a clean install silently reverts it. Any
+`sitecustomize.py` is intentionally not compared (it may legitimately belong to
+the Antigravity plugin).
 
-**Recover (only restores sitecustomize.py + patch):**
+**Recover (reinstalls the .pth/bootstrap hook + patch):**
 ```bash
-cd ~/hermes-claude-auth
+cd ~/.hermes/patches/hermes-claude-auth
 git pull && ./install.sh --post-update
 ```
 
 **Full recovery:**
 ```bash
-cd ~/hermes-claude-auth
+cd ~/.hermes/patches/hermes-claude-auth
 git pull && ./install.sh
 ```
+
+> **Note:** `install.sh` restarts `hermes-gateway` at the end. Running it from
+> *inside* a live Hermes agent session can be blocked by the gateway's
+> self-termination guard — run it from a separate shell.
 
 ### What survives `hermes update`
 
 | File | Location | Survives? |
 |------|----------|:---:|
 | `anthropic_billing_bypass.py` | `~/.hermes/patches/` | ✅ Outside repo |
-| **`sitecustomize.py`** | venv `site-packages/` | ❌ Overwritten |
+| **`hermes_claude_auth.pth`** | venv `site-packages/` | ❌ Removed on venv rebuild |
+| **`_hermes_claude_auth_bootstrap.py`** | venv `site-packages/` | ❌ Removed on venv rebuild |
 | Claude credentials | `~/.claude/` | ✅ Managed by Claude CLI |
 | Auth token | `~/.hermes/auth.json` | ✅ Outside repo |
 
-Only `sitecustomize.py` needs recovery. `--post-update` does exactly that.
+Only the `.pth`/bootstrap pair needs recovery. `--post-update` does exactly that.
 
 ## Compatibility
 - Tested with hermes-agent on Python 3.11+
@@ -325,9 +364,11 @@ the other was folded in or dropped:
   multi-interpreter install was ported onto the `.pth` mechanism so the hook
   also lands in an editable install used by the CLI.
 - **PR #23** — thinking-block replay integrity, tool-pair repair hardening, and
-  the `agent.error_classifier` hook. Its installer rewrite (`--check`,
-  `.git/hooks/post-merge`) was dropped in favour of PR #28's recovery model,
-  which deliberately avoids `.git/hooks` because `hermes update` stashes it.
+  the `agent.error_classifier` hook. Its installer `--check` mode was kept, and
+  `install.sh` does install `.git/hooks/post-merge`. Because `hermes update`
+  can stash the in-repo hooks dir, PR #28's `core.hooksPath` layer (plus the
+  `restore_loader.sh` cron watchdog) is the more reliable of the two — see
+  "Surviving `hermes update`" for the recommended setup.
 - **PR #20** — per-pool-entry `account_uuid` billing routing for multi-account
   credential pools.
 - **PR #1** — clone URL fix.
@@ -426,13 +467,13 @@ Not merged:
 
 - **Auto-wait won't kick in / 429 reaches the user immediately**: the patch
   is disabled. Re-enable with `HERMES_RL_AUTOWAIT=1` (the default). It
-  requires the `sitecustomize.py` hook to be installed (run `./install.sh`
+  requires the `.pth`/bootstrap hook to be installed (run `./install.sh`
   and check with `./install.sh --check`).
 - **Auto-wait bails with "this is bigger than safety-cap" on a weekly limit**:
   you're on an older build (< v1.5.9). v1.5.9 added window-aware
   detection — it now reads `anthropic-ratelimit-unified-7d-status` /
   `-reset` and waits up to `HERMES_RL_AUTOWAIT_MAX_7D_S` (default 7.5d).
-  Upgrade: `cd ~/hermes-claude-auth && git pull && ./install.sh`.
+  Upgrade: `cd ~/.hermes/patches/hermes-claude-auth && git pull && ./install.sh`.
 - **Want a shorter / longer wait for a specific window**: tune the
   per-window cap via env vars (values in seconds, units in
   `~/.hermes/.env` or your systemd unit):
