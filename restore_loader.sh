@@ -9,6 +9,11 @@
 #     --no-agent --script restore_loader.sh --deliver local
 #
 # Idempotent and lightweight: exits immediately when the hook is already intact.
+#
+# Output contract (matches Hermes `--no-agent` cron semantics): stdout is
+# delivered to the user verbatim, so the healthy path prints NOTHING to stdout
+# (silent tick). A restore or failure prints one line to stdout so it surfaces
+# as an alert; a failure also exits non-zero.
 
 set -u
 
@@ -27,8 +32,8 @@ fi
 
 INSTALL="$HERMES_ROOT/patches/hermes-claude-auth/install.sh"
 if [ ! -x "$INSTALL" ]; then
-  echo "[restore_loader] installer not found at $INSTALL — skipping" >&2
-  exit 0
+  echo "[restore_loader] installer not found at $INSTALL — cannot restore hermes-claude-auth"
+  exit 1
 fi
 
 # Fast presence check across every plausible venv under hermes-agent.
@@ -47,10 +52,15 @@ for base in "$AGENT_DIR/venv" "$AGENT_DIR/.venv"; do
 done
 
 if [ "$HOOK_PRESENT" -eq 1 ]; then
-  echo "[restore_loader] hook intact — nothing to do" >&2
+  # Healthy — stay silent on stdout so the cron tick delivers nothing.
   exit 0
 fi
 
-echo "[restore_loader] hook missing or outdated — restoring" >&2
-HERMES_HOME="$HERMES_ROOT" "$INSTALL" --post-update >&2 || true
-exit 0
+LOG="${TMPDIR:-/tmp}/hermes_claude_auth_restore.log"
+if HERMES_HOME="$HERMES_ROOT" "$INSTALL" --post-update >"$LOG" 2>&1; then
+  echo "[restore_loader] Restored hermes-claude-auth loader (.pth/bootstrap hook was missing — likely after hermes update)."
+  exit 0
+else
+  echo "[restore_loader] Reinstall FAILED — see $LOG"
+  exit 1
+fi
