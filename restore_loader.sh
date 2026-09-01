@@ -1,21 +1,56 @@
 #!/bin/sh
-# Restore hermes-claude-auth loader if missing from the venv after hermes update.
-# Runs via Hermes cron (every 15m). Idempotent: only acts if loader is missing
-# or has been replaced by a non-claude-auth sitecustomize.py.
+# Watchdog restore for hermes-claude-auth — re-applies the bypass if a
+# `hermes update` venv rebuild wiped the `.pth`/bootstrap hook from
+# site-packages. The post-merge git hook covers the merge step, but a venv
+# rebuild that happens after the merge isn't caught by git hooks; this cron
+# watchdog closes that gap. Intended to run via Hermes cron (every 15m):
+#
+#   hermes cron create "every 15m" --name restore-claude-auth-loader \
+#     --no-agent --script restore_loader.sh --deliver local
+#
+# Idempotent and lightweight: exits immediately when the hook is already intact.
 
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) LOCAL="${LOCALAPPDATA:-/c/Users/ronal/AppData/Local}" ;;
-  *) LOCAL="${XDG_DATA_HOME:-$HOME/.local/share}" ;;
-esac
+set -u
 
-LOADERDST="$LOCAL/Hermes/hermes-agent/venv/Lib/site-packages/sitecustomize.py"
-LOADERSRC="$LOCAL/hermes/patches/sitecustomize.py"
-LOG="$LOCAL/hermes/logs/restore_loader.log"
-
-if [ ! -f "$LOADERDST" ] || ! grep -q "hermes-claude-auth managed" "$LOADERDST" 2>/dev/null; then
-  if [ -f "$LOADERSRC" ]; then
-    cp -f "$LOADERSRC" "$LOADERDST" 2>/dev/null \
-      && echo "[restore_loader] $(date) loader restored (was missing/replaced)" >> "$LOG" 2>/dev/null
-  fi
+# Resolve the Hermes data ROOT (patches live there). HERMES_HOME may point at a
+# profile dir (.../hermes/profiles/<name>); walk up to the root in that case.
+if [ -n "${HERMES_HOME:-}" ]; then
+  HERMES_ROOT="$HERMES_HOME"
+  case "$(basename "$(dirname "$HERMES_HOME")")" in
+    profiles) HERMES_ROOT="$(dirname "$(dirname "$HERMES_HOME")")" ;;
+  esac
+elif [ -n "${LOCALAPPDATA:-}" ]; then
+  HERMES_ROOT="$LOCALAPPDATA/hermes"
+else
+  HERMES_ROOT="$HOME/.hermes"
 fi
+
+INSTALL="$HERMES_ROOT/patches/hermes-claude-auth/install.sh"
+if [ ! -x "$INSTALL" ]; then
+  echo "[restore_loader] installer not found at $INSTALL — skipping" >&2
+  exit 0
+fi
+
+# Fast presence check across every plausible venv under hermes-agent.
+AGENT_DIR="$HERMES_ROOT/hermes-agent"
+HOOK_PRESENT=0
+for base in "$AGENT_DIR/venv" "$AGENT_DIR/.venv"; do
+  [ -d "$base" ] || continue
+  pth="$(find "$base" -maxdepth 5 -name 'hermes_claude_auth.pth' -print -quit 2>/dev/null)"
+  boot="$(find "$base" -maxdepth 5 -name '_hermes_claude_auth_bootstrap.py' -print -quit 2>/dev/null)"
+  if [ -n "$pth" ] && [ -n "$boot" ] \
+     && grep -q "import _hermes_claude_auth_bootstrap" "$pth" 2>/dev/null \
+     && grep -q "hermes-claude-auth managed" "$boot" 2>/dev/null; then
+    HOOK_PRESENT=1
+    break
+  fi
+done
+
+if [ "$HOOK_PRESENT" -eq 1 ]; then
+  echo "[restore_loader] hook intact — nothing to do" >&2
+  exit 0
+fi
+
+echo "[restore_loader] hook missing or outdated — restoring" >&2
+HERMES_HOME="$HERMES_ROOT" "$INSTALL" --post-update >&2 || true
 exit 0

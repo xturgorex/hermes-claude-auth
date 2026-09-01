@@ -782,7 +782,7 @@ def test_bypass_normalizes_agent_sdk_identity_to_claude_code(new_identity_api_kw
 
     identity_entry = new_identity_api_kwargs["system"][1]
     assert identity_entry["text"] == _SYSTEM_IDENTITY
-    assert identity_entry.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
+    assert identity_entry.get("cache_control") == {"type": "ephemeral", "ttl": "5m"}
 
 
 def test_bypass_emits_exactly_one_identity_entry(new_identity_api_kwargs):
@@ -808,7 +808,7 @@ def test_bypass_injects_cache_control_on_identity(basic_api_kwargs):
     apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
 
     identity_entry = basic_api_kwargs["system"][1]
-    assert identity_entry["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert identity_entry["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
 
 
 def test_bypass_injects_context_management_via_extra_body(basic_api_kwargs):

@@ -77,13 +77,13 @@ if $CHECK_ONLY; then
         && grep -q "$MARKER" "$SITE_PACKAGES/$BOOTSTRAP_NAME"; then
         printf "${GREEN}[✓] .pth/bootstrap hook present${RESET}\n"
     else
-        printf "${RED}[✗] sitecustomize hook MISSING or outdated${RESET}\n"
+        printf "${RED}[✗] .pth/bootstrap hook MISSING or outdated${RESET}\n"
         ALL_OK=false
     fi
 
     POST_MERGE_HOOK="$HERMES_AGENT_DIR/.git/hooks/post-merge"
     if [[ -f "$POST_MERGE_HOOK" && -x "$POST_MERGE_HOOK" ]] \
-        && grep -q "Recovering Claude Code bypass" "$POST_MERGE_HOOK" 2>/dev/null; then
+        && grep -q "HERMES-CLAUDE-AUTH-HOOK" "$POST_MERGE_HOOK" 2>/dev/null; then
         printf "${GREEN}[✓] auto-recovery hook present${RESET}\n"
     elif [[ -d "$HERMES_AGENT_DIR/.git/hooks" ]]; then
         printf "${YELLOW}[!] auto-recovery hook not installed (optional)${RESET}\n"
