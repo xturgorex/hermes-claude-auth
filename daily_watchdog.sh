@@ -96,14 +96,23 @@ fi
 # Anthropic rejects requests claiming a Claude Code version below a moving
 # minimum ("version X or newer is required"). The bypass reads the installed
 # `claude` version, so keeping the CLI current keeps the fingerprint valid.
-if command -v npm >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
+if command -v claude >/dev/null 2>&1; then
   cur="$(claude --version 2>/dev/null | awk '{print $1}')"
-  latest="$(npm view @anthropic-ai/claude-code version 2>/dev/null)"
+  latest="$(npm view @anthropic-ai/claude-code version 2>/dev/null || true)"
   if [ -n "$latest" ] && [ "$cur" != "$latest" ]; then
-    if npm install -g @anthropic-ai/claude-code@"$latest" >"$LOGDIR/hermes_claude_code_update.log" 2>&1; then
-      say "[claude-auth] Claude Code CLI updated $cur → $latest (bypass fingerprint follows on next Hermes start)."
+    # Detect install method: native installer keeps versions under
+    # ~/.local/share/claude and updates via `claude update`; otherwise npm.
+    if [ -L "$(command -v claude)" ] && readlink "$(command -v claude)" | grep -q "/.local/share/claude/"; then
+      upd_cmd="claude update"
+    elif command -v npm >/dev/null 2>&1; then
+      upd_cmd="npm install -g @anthropic-ai/claude-code@$latest"
     else
-      say "[claude-auth] Claude Code CLI update to $latest FAILED — see $LOGDIR/hermes_claude_code_update.log"; RC=1
+      upd_cmd=""
+    fi
+    if [ -n "$upd_cmd" ] && $upd_cmd >"$LOGDIR/hermes_claude_code_update.log" 2>&1; then
+      say "[claude-auth] Claude Code CLI updated $cur → $(claude --version 2>/dev/null | awk '{print $1}') via '$upd_cmd'."
+    elif [ -n "$upd_cmd" ]; then
+      say "[claude-auth] Claude Code CLI update ($upd_cmd) FAILED — see $LOGDIR/hermes_claude_code_update.log"; RC=1
     fi
   fi
 fi
