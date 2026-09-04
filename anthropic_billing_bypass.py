@@ -176,7 +176,7 @@ _STAINLESS_NODE_VERSION = "v24.3.0"
 # Tracks upstream griffinmartin/opencode-claude-auth ``ccVersion`` (currently
 # "2.1.217", src/model-config.ts).  When Claude Code IS on PATH the detected
 # version wins, so this only matters on hosts without the CLI installed.
-_PINNED_CC_VERSION = "2.1.217"
+_PINNED_CC_VERSION = "2.1.260"
 
 # Cache for the dynamically detected Claude Code version.
 _CC_VERSION_CACHE: Optional[str] = None
