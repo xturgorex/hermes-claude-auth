@@ -43,7 +43,7 @@ What the installer does:
 - Auto-detects your hermes directory (`$HERMES_HOME` if set, else `%LOCALAPPDATA%\hermes\` on Windows and `~/.hermes/` on Linux/macOS)
 - Copies `anthropic_billing_bypass.py` to `<hermes-dir>/patches/`
 - Installs a `.pth` shim + bootstrap module into the hermes venv's site-packages (this loads the hook at interpreter startup; see "How it works" below for why a `.pth` and not `sitecustomize.py`)
-- Mirrors Claude Code credentials from the OS credential store to `~/.claude/.credentials.json` (macOS Keychain / Windows Credential Manager)
+- Mirrors Claude Code credentials from the OS credential store to `~/.claude/.credentials.json` (macOS Keychain / Windows Credential Manager) **only when that file is missing or unusable** — it never overwrites a live record, because Claude Code refreshes the file independently of the store and copying a stale record over it would log Claude Code out
 - Restarts `hermes-gateway.service` if running (Linux only)
 
 ## Agent Handoff Prompt
@@ -163,6 +163,50 @@ hermes cron create "every 15m" --name restore-claude-auth-loader \
 
 The cron job only fires while the Hermes gateway is running — after an update,
 the loader is restored within ≤15 minutes of the gateway coming back up.
+
+**Layer 3 — daily watchdog (keeps the credential itself alive):**
+
+Run `daily_watchdog.sh` on **every** install — one cron job per host, and it is
+safe to leave enabled everywhere. It is host-local by design: it never copies
+credentials between hosts or between stores, and each host keeps its own session
+alive.
+
+In order, it: pulls the clone; restores the loader; keeps the Claude Code CLI
+current (migrating a CLI that is *not writable by the current user*, e.g. a
+root-owned `/usr/lib/node_modules` install, to the native per-user install
+rather than failing every night); keeps this host's credential fresh; and
+registers aliases for newly released Claude models.
+
+Credential upkeep is platform-split, because the canonical store differs:
+
+| Platform | Canonical store | Who refreshes |
+|---|---|---|
+| Linux | `~/.claude/.credentials.json` | the watchdog (`--mode refresh`) |
+| macOS | Keychain (the file is a fallback) | Claude Code; the watchdog only verifies (`--mode verify`) |
+
+Refresh tokens are **single-use and rotate**, so exactly one refresher per host
+may exist: two would race and the loser is invalidated (`invalid_grant`), which
+strips the stored credential. The watchdog is that one refresher on Linux; on
+macOS it deliberately does not refresh, because Claude Code owns the Keychain.
+
+It refreshes over the **browser-free** OAuth path, so an idle host stays
+authenticated with no GUI. It is silent on a healthy host — stdout is reserved
+for states a human must clear — and it appends both expiry stamps to
+`$HERMES_HOME/patches/.claude_cred_history` on every run, so you can measure
+whether the refresh-token window rolls forward.
+
+**Autonomy limit, stated plainly:** a host renews itself indefinitely *while a
+refresh happens inside its refresh-token window* (Claude Code issues roughly a
+30-day window; each refresh rotates it). A **first** login, or a refresh token
+that has died, needs one interactive approval — but not a GUI on the server:
+
+```bash
+claude auth login --claudeai   # prints a URL; approve it on any device, paste the code back
+```
+
+That step is intentionally not automated — nothing can approve an OAuth consent
+on the user's behalf. If you want an option that never needs a human, that is an
+`ANTHROPIC_API_KEY` (pay-as-you-go rather than your subscription plan).
 
 Both layers are idempotent and never break the update. The canonical patch and
 this clone live outside any managed repo, at
@@ -398,9 +442,13 @@ Not merged:
 
 ### Auth issues
 
-- **`Anthropic 401 authentication failed`** or **`No Anthropic credentials found`**: Hermes reads Claude subscription credentials from `~/.claude/.credentials.json`. If Claude Code is authenticated (e.g. in macOS Keychain) but that file is missing or stale, Hermes fails even when Claude Code itself works.
+- **`Anthropic 401 authentication failed`** or **`No Anthropic credentials found`**: Hermes reads Claude subscription credentials from the OS credential store (macOS Keychain) *and* from `~/.claude/.credentials.json`, and uses whichever record is valid. It fails only when neither holds a live token.
 
-  On macOS, `install.sh` v1.1.1+ auto-mirrors the `Claude Code-credentials` Keychain entry into `~/.claude/.credentials.json` on every run, so re-running the installer is usually enough. Full fix:
+  On macOS, `install.sh` mirrors the `Claude Code-credentials` Keychain entry into `~/.claude/.credentials.json` **only when that file is missing or unusable**. It deliberately never overwrites a usable file: Claude Code 2.1.x refreshes the file independently of the Keychain, so copying a stale Keychain record — for instance one left token-stripped by a failed refresh — over a live file logs Claude Code out *and* breaks the `anthropic` provider. When the file is already good you will see `credentials file is valid — left untouched`.
+
+  > **If `claude auth status` says `loggedIn: true` while Hermes reports "No Anthropic credentials found"**, check validity before copying anything by hand. A blind `security ... > ~/.claude/.credentials.json` is how a working install gets logged out. The installer's `cred_is_usable` helper (valid JSON, non-empty `accessToken`, unexpired `expiresAt`) is the rule to apply.
+
+  Full fix:
 
   1. Refresh Claude subscription login:
      ```bash

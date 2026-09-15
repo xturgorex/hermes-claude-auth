@@ -187,13 +187,28 @@ public class HermesCredManager {
             New-Item -ItemType Directory -Path $CredDir -Force | Out-Null
         }
         $Existing = if (Test-Path $CredFile) { Get-Content $CredFile -Raw -ErrorAction SilentlyContinue } else { $null }
-        if ($Existing -ne $CredSecret) {
-            [System.IO.File]::WriteAllText($CredFile, $CredSecret)
-            Write-Ok "Mirrored Claude Code credentials from Credential Manager to $CredFile"
-        } else {
-            Write-Ok 'Claude Code credentials file already matches Credential Manager'
+        # Validity-aware: never overwrite a usable file with a Credential Manager
+        # record. Claude Code refreshes the file independently, so Credential
+        # Manager can lag behind it; copying a stale/blank record over a live
+        # file logs Claude Code out and breaks the anthropic provider.
+        function Test-HermesCredUsable([string]$Json) {
+            if ([string]::IsNullOrWhiteSpace($Json)) { return $false }
+            try { $OAuth = ($Json | ConvertFrom-Json).claudeAiOauth } catch { return $false }
+            if (-not $OAuth -or [string]::IsNullOrWhiteSpace($OAuth.accessToken)) { return $false }
+            if ($OAuth.expiresAt -and ([long]$OAuth.expiresAt) -le ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 60000)) { return $false }
+            return $true
         }
-        $CredMirrored = $true
+        if (Test-HermesCredUsable $Existing) {
+            Write-Ok 'Claude Code credentials file is valid - left untouched'
+            $CredMirrored = $true
+        } elseif (Test-HermesCredUsable $CredSecret) {
+            [System.IO.File]::WriteAllText($CredFile, $CredSecret)
+            Write-Ok "Mirrored Claude Code credentials from Credential Manager to $CredFile (file was missing or expired)"
+            $CredMirrored = $true
+        } else {
+            Write-Warn 'Credentials file and Credential Manager copy are both unusable - leaving both untouched'
+            Write-Host '    Run: claude auth login --claudeai'
+        }
     }
 } catch {
     # P/Invoke may fail in constrained language mode — fall through to warning

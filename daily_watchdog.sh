@@ -11,7 +11,17 @@
 #               never auto-merges over local fixes).
 #   2. RESTORE  delegate to restore_loader.sh (re-applies the .pth/bootstrap
 #               hook if a venv rebuild wiped it).
-#   3. MODELS   fetch Anthropic's models overview, diff the "Claude API ID"
+#   3. CLI      keep the Claude Code CLI current, and migrate a host whose CLI
+#               is not writable by the current user to the native per-user
+#               install (any Linux/macOS host, no root required).
+#   4. CREDS    keep THIS host's credential alive over the browser-free refresh
+#               path. Linux refreshes (it owns the credential file); macOS only
+#               verifies, because Claude Code owns the Keychain there. Silent
+#               unless a human is needed. Never copies credentials between
+#               hosts or between stores, and never mints credentials from
+#               scratch — a first login / dead refresh token is a human step:
+#               `claude auth login --claudeai` (no GUI needed on the server).
+#   5. MODELS   fetch Anthropic's models overview, diff the "Claude API ID"
 #               row against the last-seen set. For every NEW model ID:
 #               smoke-test it through the bypass, and on success register
 #               Hermes aliases (`<id minus claude- and date>` plus the family
@@ -60,7 +70,12 @@ if [ -d "$CLONE/.git" ]; then
     if git -C "$CLONE" pull -q --ff-only origin main >>"$LOGDIR/hermes_claude_auth_daily.log" 2>&1; then
       after="$(git -C "$CLONE" rev-parse HEAD 2>/dev/null)"
       if [ "$before" != "$after" ]; then
-        say "[claude-auth] Clone updated ${before:0:7} → ${after:0:7} (origin/main)."
+        # Routine clone moves are logged, not announced: every host pulls, so
+        # announcing on each would double every message. Only substantive
+        # events (a redeploy, or a failure) reach stdout.
+        printf '%s [claude-auth] clone %s → %s (origin/main)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${before:0:7}" "${after:0:7}" \
+          >>"$LOGDIR/hermes_claude_auth_daily.log" 2>/dev/null || true
         if ! git -C "$CLONE" diff --quiet "$before" "$after" -- anthropic_billing_bypass.py _hermes_claude_auth_bootstrap.py hermes_claude_auth.pth; then
           if HERMES_HOME="$HERMES_ROOT" "$CLONE/install.sh" --post-update >"$LOGDIR/hermes_claude_auth_daily_install.log" 2>&1; then
             say "[claude-auth] Bypass module changed — redeployed via install.sh --post-update."
@@ -96,24 +111,101 @@ fi
 # Anthropic rejects requests claiming a Claude Code version below a moving
 # minimum ("version X or newer is required"). The bypass reads the installed
 # `claude` version, so keeping the CLI current keeps the fingerprint valid.
-if command -v claude >/dev/null 2>&1; then
-  cur="$(claude --version 2>/dev/null | awk '{print $1}')"
+#
+# Install layout decides updateability, so a host whose `claude` is not
+# writable by the current user is migrated to the native per-user install
+# (~/.local/share/claude, self-updating via `claude update`) rather than
+# failing every night. That keeps this one script correct on any Linux/macOS
+# host with no per-host forks.
+cc_version_of() { "$1" --version 2>/dev/null | awk '{print $1}'; }
+
+install_native_claude() {
+  # $1 = reason, for the message on failure
+  if ! command -v curl >/dev/null 2>&1; then
+    say "[claude-auth] $1 and curl is unavailable — cannot install the native Claude Code CLI."; RC=1; return 1
+  fi
+  if curl -fsSL --max-time 120 https://claude.ai/install.sh 2>/dev/null \
+       | bash >"$LOGDIR/hermes_claude_code_install.log" 2>&1; then
+    hash -r 2>/dev/null || true
+    return 0
+  fi
+  say "[claude-auth] $1 and the native install FAILED — see $LOGDIR/hermes_claude_code_install.log"; RC=1
+  return 1
+}
+
+CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+if [ -z "$CLAUDE_BIN" ]; then
+  if install_native_claude "Claude Code CLI is not installed"; then
+    new_bin="$(command -v claude 2>/dev/null || true)"
+    [ -n "$new_bin" ] \
+      && say "[claude-auth] Installed the native Claude Code CLI ($(cc_version_of "$new_bin")) at $new_bin."
+  fi
+else
+  cur="$(cc_version_of "$CLAUDE_BIN")"
   latest="$(npm view @anthropic-ai/claude-code version 2>/dev/null || true)"
   if [ -n "$latest" ] && [ "$cur" != "$latest" ]; then
-    # Detect install method: native installer keeps versions under
-    # ~/.local/share/claude and updates via `claude update`; otherwise npm.
-    if [ -L "$(command -v claude)" ] && readlink "$(command -v claude)" | grep -q "/.local/share/claude/"; then
-      upd_cmd="claude update"
-    elif command -v npm >/dev/null 2>&1; then
-      upd_cmd="npm install -g @anthropic-ai/claude-code@$latest"
+    if [ -L "$CLAUDE_BIN" ] && readlink "$CLAUDE_BIN" | grep -q "/.local/share/claude/"; then
+      # Native install: `claude update` needs no root on any platform.
+      if claude update >"$LOGDIR/hermes_claude_code_update.log" 2>&1; then
+        say "[claude-auth] Claude Code CLI updated $cur → $(cc_version_of "$CLAUDE_BIN") via 'claude update'."
+      else
+        say "[claude-auth] Claude Code CLI update ('claude update') FAILED — see $LOGDIR/hermes_claude_code_update.log"; RC=1
+      fi
     else
-      upd_cmd=""
+      npm_prefix="$(npm config get prefix 2>/dev/null || true)"
+      if command -v npm >/dev/null 2>&1 && [ -n "$npm_prefix" ] && [ -w "$npm_prefix/lib/node_modules" ]; then
+        if npm install -g "@anthropic-ai/claude-code@$latest" >"$LOGDIR/hermes_claude_code_update.log" 2>&1; then
+          say "[claude-auth] Claude Code CLI updated $cur → $latest via 'npm install -g'."
+        else
+          say "[claude-auth] Claude Code CLI update (npm install -g) FAILED — see $LOGDIR/hermes_claude_code_update.log"; RC=1
+        fi
+      else
+        # e.g. a root-owned /usr/lib/node_modules install: npm cannot fix this
+        # without root, so migrate to the native per-user install instead.
+        if install_native_claude "Claude Code CLI at $CLAUDE_BIN is not writable by $(id -un)"; then
+          new_bin="$(command -v claude 2>/dev/null || true)"
+          if [ -n "$new_bin" ] && [ "$new_bin" != "$CLAUDE_BIN" ]; then
+            say "[claude-auth] Migrated Claude Code CLI to the native install: $(cc_version_of "$new_bin") at $new_bin (was $cur at $CLAUDE_BIN)."
+          else
+            say "[claude-auth] Installed the native Claude Code CLI, but 'claude' still resolves to $CLAUDE_BIN ($cur). Put \$HOME/.local/bin ahead of it in PATH, or remove that copy."; RC=1
+          fi
+        fi
+      fi
     fi
-    if [ -n "$upd_cmd" ] && $upd_cmd >"$LOGDIR/hermes_claude_code_update.log" 2>&1; then
-      say "[claude-auth] Claude Code CLI updated $cur → $(claude --version 2>/dev/null | awk '{print $1}') via '$upd_cmd'."
-    elif [ -n "$upd_cmd" ]; then
-      say "[claude-auth] Claude Code CLI update ($upd_cmd) FAILED — see $LOGDIR/hermes_claude_code_update.log"; RC=1
+  fi
+fi
+
+# ── 2c. CREDENTIAL HEALTH ──────────────────────────────────────────────
+# Keep THIS host's Claude credential alive, on its own, with no browser and no
+# copying between hosts or stores. Refresh tokens are single-use and rotate, so
+# exactly one refresher per host may exist: credential_health.py refreshes on
+# hosts that own their credential file (Linux) and only verifies on macOS,
+# where Claude Code owns the Keychain. It is silent unless a human is needed.
+CRED_HELPER="$CLONE/credential_health.py"
+if [ -f "$CRED_HELPER" ]; then
+  VENV_PY=""
+  for cand in "$HERMES_ROOT/hermes-agent/venv/bin/python" "$HERMES_ROOT/hermes-agent/.venv/bin/python"; do
+    [ -x "$cand" ] && VENV_PY="$cand" && break
+  done
+  if [ -n "$VENV_PY" ]; then
+    case "$(uname -s)" in
+      Darwin) CRED_MODE="verify" ;;
+      *)      CRED_MODE="refresh" ;;
+    esac
+    # Capture stdout ONLY: the .pth/bootstrap pair writes progress lines to
+    # stderr on every interpreter start, and merging it in would deliver that
+    # noise as a cron message every night.
+    if cred_out="$("$VENV_PY" "$CRED_HELPER" --mode "$CRED_MODE" \
+                      --history "$HERMES_ROOT/patches/.claude_cred_history" \
+                      2>"$LOGDIR/hermes_claude_cred.log")"; then
+      [ -n "$cred_out" ] && say "$cred_out"
+    else
+      [ -n "$cred_out" ] && say "$cred_out"
+      say "[claude-auth] credential check failed — see $LOGDIR/hermes_claude_cred.log"
+      RC=1
     fi
+  else
+    say "[claude-auth] credentials: hermes venv python not found — credential check skipped."; RC=1
   fi
 fi
 

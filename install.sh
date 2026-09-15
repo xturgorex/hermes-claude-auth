@@ -255,17 +255,54 @@ if [ -d "$GIT_HOOKS_DIR" ] && [ -n "$HOOK_SRC" ] && [ -f "$HOOK_SRC" ]; then
     printf "${GREEN}[✓] Installed auto-recovery hook (post-merge)${RESET}\n"
 fi
 
-# ── macOS Keychain mirror ───────────────────────────────────────────
+# ── macOS Keychain mirror (validity-aware) ──────────────────────────
+# Hermes reads BOTH the Keychain and ~/.claude/.credentials.json and uses
+# whichever record is valid, so this file is a compatibility fallback for
+# readers that only look at the file.
+#
+# NEVER overwrite a usable file with a Keychain record. Claude Code 2.1.x
+# refreshes the FILE independently of the Keychain, so the Keychain entry can
+# lag behind it (or hold a token-stripped record after a failed refresh race).
+# Copying that over a live file logs Claude Code out and breaks Hermes'
+# anthropic provider — observed in the wild.
+cred_is_usable() {
+    # JSON payload on stdin -> 0 when it holds a non-empty, unexpired token.
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys, time
+try:
+    o = json.loads(sys.stdin.read()).get("claudeAiOauth") or {}
+except Exception:
+    sys.exit(1)
+if not (o.get("accessToken") or "").strip():
+    sys.exit(1)
+exp = o.get("expiresAt") or 0
+# expiresAt == 0 means "managed key / unknown expiry" -> treat as usable
+if exp and int(time.time() * 1000) >= int(exp) - 60000:
+    sys.exit(1)
+'
+        return $?
+    fi
+    # No python3: conservative — reject only an explicitly empty access token.
+    case "$(cat)" in
+        *'"accessToken":""'*|*'"accessToken": ""'*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 if [ "$(uname -s)" = "Darwin" ]; then
     CRED_FILE="$HOME/.claude/.credentials.json"
     if KEYCHAIN_CRED="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)"; then
-        mkdir -p "$(dirname "$CRED_FILE")"
-        if [ ! -f "$CRED_FILE" ] || [ "$(cat "$CRED_FILE" 2>/dev/null)" != "$KEYCHAIN_CRED" ]; then
+        if [ -f "$CRED_FILE" ] && printf '%s' "$(cat "$CRED_FILE" 2>/dev/null)" | cred_is_usable; then
+            printf "${GREEN}[✓] Claude Code credentials file is valid — left untouched${RESET}\n"
+        elif printf '%s' "$KEYCHAIN_CRED" | cred_is_usable; then
+            mkdir -p "$(dirname "$CRED_FILE")"
             printf '%s' "$KEYCHAIN_CRED" >"$CRED_FILE"
             chmod 600 "$CRED_FILE"
-            printf "${GREEN}[✓] Mirrored Claude Code credentials from Keychain → %s${RESET}\n" "$CRED_FILE"
+            printf "${GREEN}[✓] Mirrored Claude Code credentials from Keychain → %s (file was missing or expired)${RESET}\n" "$CRED_FILE"
         else
-            printf "${GREEN}[✓] Claude Code credentials file already matches Keychain${RESET}\n"
+            printf "${YELLOW}[!] Credentials file and Keychain copy are both unusable — leaving both untouched${RESET}\n"
+            printf "    Run: claude auth login --claudeai\n"
         fi
     elif [ ! -f "$CRED_FILE" ]; then
         printf "${YELLOW}[!] macOS detected but no 'Claude Code-credentials' Keychain entry found${RESET}\n"
