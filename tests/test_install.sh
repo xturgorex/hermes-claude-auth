@@ -165,7 +165,7 @@ exec /usr/bin/uname "$@"
 UNAME_EOF
 chmod +x "$FAKE_BIN/uname"
 
-FAKE_CRED='{"oauth":{"accessToken":"sk-ant-fake","refreshToken":"rt-fake","expiresAt":0}}'
+FAKE_CRED='{"claudeAiOauth":{"accessToken":"sk-ant-fake","refreshToken":"rt-fake","expiresAt":0,"scopes":["user:inference"]}}'
 cat > "$FAKE_BIN/security" <<SECURITY_EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = "find-generic-password" ] && [ "\${2:-}" = "-s" ] \\
@@ -234,6 +234,43 @@ if PATH="$FAKE_BIN:$PATH" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     assert_file_not_exists "$T8" "$FAKE_HOME/.claude/.credentials.json" && pass "$T8"
 else
     fail "$T8" "install.sh exited non-zero when Keychain entry absent"
+fi
+
+# Test 8b: a stale/blank Keychain record must NEVER clobber a valid file.
+# Regression test: install.sh used to mirror whenever the two differed, which
+# copied a token-stripped Keychain record over the live file — logging Claude
+# Code out and breaking Hermes' anthropic provider (hit in the wild).
+T8B="Test 8b: stale Keychain record does not clobber a valid credentials file"
+rm -rf "$FAKE_HOME/.claude"
+mkdir -p "$FAKE_HOME/.claude"
+VALID_CRED='{"claudeAiOauth":{"accessToken":"sk-ant-live","refreshToken":"rt-live","expiresAt":9999999999999,"scopes":["user:inference"]}}'
+printf '%s' "$VALID_CRED" >"$FAKE_HOME/.claude/.credentials.json"
+STALE_CRED='{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":["user:inference"]}}'
+cat > "$FAKE_BIN/security" <<SECURITY_STALE_EOF
+#!/usr/bin/env bash
+printf '%s' '$STALE_CRED'
+exit 0
+SECURITY_STALE_EOF
+chmod +x "$FAKE_BIN/security"
+
+if PATH="$FAKE_BIN:$PATH" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    actual="$(cat "$FAKE_HOME/.claude/.credentials.json")"
+    if [ "$actual" = "$VALID_CRED" ]; then
+        pass "$T8B"
+    else
+        fail "$T8B" "valid credentials were overwritten: got '$actual'"
+    fi
+else
+    fail "$T8B" "install.sh exited non-zero with a stale Keychain record"
+fi
+
+# Test 8c: when the Keychain record is unusable and no file exists, write nothing
+T8C="Test 8c: unusable Keychain record with no file writes nothing"
+rm -rf "$FAKE_HOME/.claude"
+if PATH="$FAKE_BIN:$PATH" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    assert_file_not_exists "$T8C" "$FAKE_HOME/.claude/.credentials.json" && pass "$T8C"
+else
+    fail "$T8C" "install.sh exited non-zero with unusable Keychain record and no file"
 fi
 
 # Test 9: Custom HERMES_HOME is respected
