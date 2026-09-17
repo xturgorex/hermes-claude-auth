@@ -156,8 +156,11 @@ else
       if command -v npm >/dev/null 2>&1 && [ -n "$npm_prefix" ] && [ -w "$npm_prefix/lib/node_modules" ]; then
         if npm install -g "@anthropic-ai/claude-code@$latest" >"$LOGDIR/hermes_claude_code_update.log" 2>&1; then
           say "[claude-auth] Claude Code CLI updated $cur → $latest via 'npm install -g'."
-        else
-          say "[claude-auth] Claude Code CLI update (npm install -g) FAILED — see $LOGDIR/hermes_claude_code_update.log"; RC=1
+        elif install_native_claude "Claude Code CLI update via 'npm install -g' failed (see $LOGDIR/hermes_claude_code_update.log)"; then
+          # A transient npm failure shouldn't alert and wait a day: fall back to
+          # the self-updating native per-user install so the host self-heals now.
+          new_bin="$(command -v claude 2>/dev/null || true)"
+          say "[claude-auth] npm update failed; migrated to the native Claude Code CLI ($(cc_version_of "${new_bin:-claude}"))${new_bin:+ at $new_bin}."
         fi
       else
         # e.g. a root-owned /usr/lib/node_modules install: npm cannot fix this
